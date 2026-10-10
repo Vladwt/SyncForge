@@ -13,6 +13,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("SyncForge")
     app.setOrganizationName("SyncForge")
+    app.setQuitOnLastWindowClosed(False)
     
     window = MainWindow()
     window.show()

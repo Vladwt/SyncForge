@@ -77,17 +77,24 @@ class WindowsVolumeScanner:
             logger.warning("Failed GetVolumeInformationW", drive=drive_path, error=str(e))
 
         try:
-            free_clusters, total_clusters, bytes_per_sector, sectors_per_cluster = win32file.GetDiskFreeSpace(drive_path)
-            cluster_size = bytes_per_sector * sectors_per_cluster
-            total_bytes = total_clusters * cluster_size
-            free_bytes = free_clusters * cluster_size
+            import shutil
+            usage = shutil.disk_usage(drive_path)
+            total_bytes = usage.total
+            free_bytes = usage.free
         except Exception as e:
-            # Fallback to shutil / os.statvfs or GetDiskFreeSpaceEx
             try:
-                import shutil
-                usage = shutil.disk_usage(drive_path)
-                total_bytes = usage.total
-                free_bytes = usage.free
+                import ctypes
+                free_b = ctypes.c_ulonglong()
+                total_b = ctypes.c_ulonglong()
+                total_free = ctypes.c_ulonglong()
+                if ctypes.windll.kernel32.GetDiskFreeSpaceExW(
+                    ctypes.c_wchar_p(drive_path),
+                    ctypes.byref(free_b),
+                    ctypes.byref(total_b),
+                    ctypes.byref(total_free)
+                ):
+                    total_bytes = total_b.value
+                    free_bytes = free_b.value
             except Exception:
                 pass
 

@@ -5,12 +5,12 @@ import uuid
 from pathlib import Path
 from typing import Optional, List
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread
-from PySide6.QtGui import QIcon, QFont, QColor
+from PySide6.QtGui import QIcon, QFont, QColor, QPixmap, QPainter, QAction
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QStackedWidget, QTableWidget, QTableWidgetItem,
     QHeaderView, QFileDialog, QLineEdit, QComboBox, QMessageBox, QProgressBar,
-    QFrame, QSplitter, QCheckBox, QSpinBox, QGroupBox, QMenu
+    QFrame, QSplitter, QCheckBox, QSpinBox, QGroupBox, QMenu, QSystemTrayIcon
 )
 from syncforge.core.models import (
     SyncProfile, FolderMapping, SyncMode, PlanAction, PlannedOperation,
@@ -23,6 +23,7 @@ from syncforge.storage.repositories import (
 )
 from syncforge.devices.device_service import DeviceService
 from syncforge.services.sync_orchestrator import SyncOrchestrator
+from syncforge.services.file_watcher import DirectoryWatcher
 from syncforge.rules.rule_engine import RuleEngine, Rule, RuleType
 from syncforge.i18n.translations import tr, set_language, format_bytes, CURRENT_LANG
 from syncforge.gui.dialogs import ProfileEditorDialog, RuleEditorDialog
@@ -100,7 +101,7 @@ QTableWidget {
 QHeaderView::section {
     background-color: #2b2d31;
     color: #e3e5e8;
-    padding: 7px;
+    padding: 8px;
     border: none;
     font-weight: bold;
 }
@@ -213,7 +214,7 @@ QTableWidget {
 QHeaderView::section {
     background-color: #e3e5e8;
     color: #2e3338;
-    padding: 7px;
+    padding: 8px;
     border: none;
     font-weight: bold;
 }
@@ -233,8 +234,27 @@ QFrame.Card {
 """
 
 
+def create_app_icon() -> QIcon:
+    """Generate high-contrast 32x32 icon with letters SF."""
+    pixmap = QPixmap(32, 32)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setBrush(QColor("#5865f2"))
+    painter.setPen(Qt.NoPen)
+    painter.drawRoundedRect(2, 2, 28, 28, 6, 6)
+    painter.setPen(QColor("white"))
+    f = QFont("Segoe UI", 12, QFont.Bold)
+    painter.setFont(f)
+    painter.drawText(pixmap.rect(), Qt.AlignCenter, "SF")
+    painter.end()
+    return QIcon(pixmap)
+
+
 class MainWindow(QMainWindow):
     """Main desktop application window."""
+
+    fs_change_signal = Signal(str)
 
     def __init__(self, db: Optional[Database] = None):
         super().__init__()
@@ -262,10 +282,94 @@ class MainWindow(QMainWindow):
         self.is_dark_theme = self.settings_repo.get("theme", "dark") == "dark"
 
         self.setWindowTitle(tr("app_title"))
-        self.resize(1180, 780)
+        self.resize(1220, 800)
+        self.setMinimumSize(950, 600)
         self.setStyleSheet(DARK_STYLESHEET if self.is_dark_theme else LIGHT_STYLESHEET)
 
+        self.app_icon = create_app_icon()
+        self.setWindowIcon(self.app_icon)
+
+        # File watcher for automatic updates
+        self.watcher = DirectoryWatcher(debounce_seconds=1.5)
+        self.watcher.start()
+        self.watcher.subscribe(self._on_fs_changed_worker)
+        self.fs_change_signal.connect(self._on_fs_changed_ui)
+
         self._init_ui()
+        self._init_system_tray()
+        self._setup_profile_watchers()
+
+    def _setup_profile_watchers(self):
+        """Watches all source directories of configured profiles."""
+        profs = self.profile_repo.list_profiles()
+        for p in profs:
+            for m in p.mappings:
+                if m.source_root:
+                    self.watcher.watch_path(m.source_root)
+
+    def _on_fs_changed_worker(self, changed_path: str):
+        self.fs_change_signal.emit(changed_path)
+
+    def _on_fs_changed_ui(self, changed_path: str):
+        """Auto-refreshes preview if active profile contains the changed path, or updates dashboard."""
+        self._refresh_dashboard()
+        if self.active_profile and self.stack.currentIndex() == 4:  # Preview page
+            is_relevant = any(
+                changed_path.lower().startswith(m.source_root.lower())
+                for m in self.active_profile.mappings
+            )
+            if is_relevant:
+                self._run_profile_preview(self.active_profile, notify=False)
+
+    def _init_system_tray(self):
+        """Initializes persistent system tray icon and menu."""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+
+        self.tray_icon = QSystemTrayIcon(self.app_icon, self)
+        self.tray_icon.setToolTip("SyncForge — File Synchronization & Backup")
+
+        tray_menu = QMenu()
+        show_action = QAction("Показати SyncForge", self)
+        show_action.triggered.connect(self._show_window)
+        tray_menu.addAction(show_action)
+
+        tray_menu.addSeparator()
+        quit_action = QAction("Вийти з програми", self)
+        quit_action.triggered.connect(self._quit_application)
+        tray_menu.addAction(quit_action)
+
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_icon.show()
+
+    def _on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.DoubleClick or reason == QSystemTrayIcon.Trigger:
+            self._show_window()
+
+    def _show_window(self):
+        self.showNormal()
+        self.activateWindow()
+
+    def _quit_application(self):
+        self.watcher.stop()
+        QApplication.quit()
+
+    def closeEvent(self, event):
+        """Intercepts window close to minimize to system tray if enabled."""
+        minimize_to_tray = self.settings_repo.get("minimize_tray", "1") == "1"
+        if minimize_to_tray and hasattr(self, "tray_icon") and self.tray_icon.isVisible():
+            self.hide()
+            self.tray_icon.showMessage(
+                "SyncForge",
+                "Програма продовжує працювати у фоновому режимі.",
+                QSystemTrayIcon.Information,
+                2000
+            )
+            event.ignore()
+        else:
+            self.watcher.stop()
+            event.accept()
 
     def _init_ui(self):
         main_widget = QWidget()
@@ -372,7 +476,6 @@ class MainWindow(QMainWindow):
         cards_layout.addWidget(self.card_conflicts)
         layout.addLayout(cards_layout)
 
-        # Quick Actions Card
         action_box = QFrame()
         action_box.setProperty("class", "Card")
         ab_layout = QVBoxLayout(action_box)
@@ -445,7 +548,8 @@ class MainWindow(QMainWindow):
             tr("device_name"), tr("mount_point"), tr("volume_serial"), tr("volume_guid"),
             tr("filesystem"), tr("free_total_space"), tr("status")
         ])
-        self.dev_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.dev_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.dev_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.dev_table)
 
         self.stack.addWidget(page)
@@ -477,6 +581,8 @@ class MainWindow(QMainWindow):
             status_item = QTableWidgetItem(tr("verified") if is_enrolled else tr("unverified"))
             status_item.setForeground(QColor("#57f287") if is_enrolled else QColor("#fee75c"))
             self.dev_table.setItem(row, 6, status_item)
+
+        self.dev_table.resizeColumnsToContents()
 
     def _enroll_selected_device(self):
         curr_row = self.dev_table.currentRow()
@@ -524,11 +630,16 @@ class MainWindow(QMainWindow):
         self.profiles_table.setHorizontalHeaderLabels([
             tr("profile_name"), tr("sync_mode"), tr("dest_folder"), tr("folders_count"), tr("actions")
         ])
-        self.profiles_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.profiles_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.profiles_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self.profiles_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.profiles_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        
+        # Interactive columns with minimum width so text is never truncated
+        header_view = self.profiles_table.horizontalHeader()
+        header_view.setSectionResizeMode(QHeaderView.Interactive)
+        header_view.setStretchLastSection(False)
+        self.profiles_table.setColumnWidth(0, 260)  # Profile name
+        self.profiles_table.setColumnWidth(1, 330)  # Mode
+        self.profiles_table.setColumnWidth(2, 280)  # Dest folder
+        self.profiles_table.setColumnWidth(3, 80)   # Folders count
+        self.profiles_table.setColumnWidth(4, 220)  # Actions
         layout.addWidget(self.profiles_table)
 
         self.stack.addWidget(page)
@@ -558,10 +669,9 @@ class MainWindow(QMainWindow):
             self.profiles_table.setItem(row, 2, QTableWidgetItem(dest_display))
             self.profiles_table.setItem(row, 3, QTableWidgetItem(str(len(p.mappings))))
 
-            # Actions widget with buttons
             act_widget = QWidget()
             act_layout = QHBoxLayout(act_widget)
-            act_layout.setContentsMargins(4, 2, 4, 2)
+            act_layout.setContentsMargins(2, 2, 2, 2)
             act_layout.setSpacing(6)
 
             run_btn = QPushButton(tr("dry_run_btn"))
@@ -587,6 +697,7 @@ class MainWindow(QMainWindow):
             new_prof = dialog.result_profile
             if new_prof:
                 self.profile_repo.save_profile(new_prof)
+                self._setup_profile_watchers()
                 self._refresh_profiles_list()
 
     def _edit_profile_dialog(self, profile: SyncProfile):
@@ -596,6 +707,7 @@ class MainWindow(QMainWindow):
             updated_prof = dialog.result_profile
             if updated_prof:
                 self.profile_repo.save_profile(updated_prof)
+                self._setup_profile_watchers()
                 self._refresh_profiles_list()
 
     def _delete_profile(self, profile: SyncProfile):
@@ -608,16 +720,18 @@ class MainWindow(QMainWindow):
             self.profile_repo.delete_profile(profile.id)
             self._refresh_profiles_list()
 
-    def _run_profile_preview(self, profile: SyncProfile):
+    def _run_profile_preview(self, profile: SyncProfile, notify: bool = True):
         try:
             active_rules = self.rule_repo.list_rules(profile.id)
             engine = RuleEngine(active_rules)
             self.current_plan = self.orchestrator.prepare_dry_run(profile, rule_engine=engine)
             self.active_profile = profile
             self._populate_preview_table(self.current_plan)
-            self._switch_page("preview")
+            if notify:
+                self._switch_page("preview")
         except Exception as e:
-            QMessageBox.critical(self, "Помилка формування плану", str(e))
+            if notify:
+                QMessageBox.critical(self, "Помилка формування плану", str(e))
 
     # --- Page 4: Rules ---
     def _build_rules_page(self):
@@ -660,7 +774,12 @@ class MainWindow(QMainWindow):
         self.rules_table.setHorizontalHeaderLabels([
             tr("rule_pattern"), tr("rule_type"), tr("rule_target"), tr("rule_priority"), tr("rule_enabled")
         ])
-        self.rules_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.rules_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.rules_table.setColumnWidth(0, 260)
+        self.rules_table.setColumnWidth(1, 260)
+        self.rules_table.setColumnWidth(2, 220)
+        self.rules_table.setColumnWidth(3, 100)
+        self.rules_table.setColumnWidth(4, 100)
         layout.addWidget(self.rules_table)
 
         self.stack.addWidget(page)
@@ -673,7 +792,6 @@ class MainWindow(QMainWindow):
             self.rules_table.insertRow(row)
             self.rules_table.setItem(row, 0, QTableWidgetItem(r.pattern))
             
-            # Localized rule type label
             type_lbl = r.rule_type.value
             if r.rule_type == RuleType.EXCLUDE_GLOB:
                 type_lbl = tr("rule_type_exclude_glob")
@@ -747,7 +865,6 @@ class MainWindow(QMainWindow):
         exec_btn.clicked.connect(self._execute_active_plan)
         top_ctrl.addWidget(exec_btn)
 
-        # Action Filter Dropdown
         self.action_filter_combo = QComboBox()
         self.action_filter_combo.addItem(tr("filter_all"), None)
         self.action_filter_combo.addItem(tr("action_copy"), PlanAction.COPY)
@@ -757,7 +874,6 @@ class MainWindow(QMainWindow):
         self.action_filter_combo.currentIndexChanged.connect(self._filter_preview_table)
         top_ctrl.addWidget(self.action_filter_combo)
 
-        # Search box
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText(tr("search_placeholder"))
         self.search_edit.textChanged.connect(self._filter_preview_table)
@@ -766,7 +882,6 @@ class MainWindow(QMainWindow):
         top_ctrl.addStretch()
         layout.addLayout(top_ctrl)
 
-        # Table & Summary
         self.summary_lbl = QLabel(tr("no_plan_notice"))
         self.summary_lbl.setStyleSheet("color: #949ba4; font-weight: 500;")
         layout.addWidget(self.summary_lbl)
@@ -775,11 +890,15 @@ class MainWindow(QMainWindow):
         self.preview_table.setHorizontalHeaderLabels([
             tr("source_file"), tr("dest_file"), tr("action"), tr("size"), tr("reason")
         ])
-        self.preview_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.preview_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.preview_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.preview_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.preview_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        
+        # Interactive columns with comfortable defaults
+        p_hdr = self.preview_table.horizontalHeader()
+        p_hdr.setSectionResizeMode(QHeaderView.Interactive)
+        p_hdr.setStretchLastSection(True)
+        self.preview_table.setColumnWidth(0, 320)
+        self.preview_table.setColumnWidth(1, 320)
+        self.preview_table.setColumnWidth(2, 200)  # Action dropdown column
+        self.preview_table.setColumnWidth(3, 90)
         layout.addWidget(self.preview_table)
 
         self.progress_bar = QProgressBar()
@@ -820,29 +939,51 @@ class MainWindow(QMainWindow):
             self.preview_table.setItem(row, 0, QTableWidgetItem(op.source_abs or "—"))
             self.preview_table.setItem(row, 1, QTableWidgetItem(op.dest_abs or "—"))
 
-            act_str = op.action.value.upper()
-            color = "#f2f3f5"
-            if op.action == PlanAction.CONFLICT:
-                act_str = tr("action_conflict")
-                color = "#ed4245"
-            elif op.action == PlanAction.COPY:
-                act_str = tr("action_copy")
-                color = "#5865f2"
-            elif op.action == PlanAction.UPDATE:
-                act_str = tr("action_update")
-                color = "#5865f2"
-            elif op.action == PlanAction.PRESERVE:
-                act_str = tr("action_preserve")
-                color = "#fee75c"
-            elif op.action == PlanAction.SKIP:
-                act_str = tr("action_skip")
-                color = "#949ba4"
+            # Interactive action selection dropdown inside table cell
+            action_combo = QComboBox()
+            action_combo.addItem(tr("action_copy"), PlanAction.COPY)
+            action_combo.addItem(tr("action_update"), PlanAction.UPDATE)
+            action_combo.addItem(tr("action_skip"), PlanAction.SKIP)
+            action_combo.addItem(tr("action_preserve"), PlanAction.PRESERVE)
+            action_combo.addItem(tr("action_conflict"), PlanAction.CONFLICT)
+            
+            # Match current op.action
+            idx = action_combo.findData(op.action)
+            if idx >= 0:
+                action_combo.setCurrentIndex(idx)
 
-            act_item = QTableWidgetItem(act_str)
-            act_item.setForeground(QColor(color))
-            self.preview_table.setItem(row, 2, act_item)
+            # Styling based on action
+            if op.action == PlanAction.CONFLICT:
+                action_combo.setStyleSheet("color: #ed4245; font-weight: bold;")
+            elif op.action in (PlanAction.COPY, PlanAction.UPDATE):
+                action_combo.setStyleSheet("color: #5865f2; font-weight: bold;")
+            elif op.action == PlanAction.PRESERVE:
+                action_combo.setStyleSheet("color: #fee75c; font-weight: bold;")
+            elif op.action == PlanAction.SKIP:
+                action_combo.setStyleSheet("color: #949ba4;")
+
+            # Connect user selection to update planned action in real-time
+            action_combo.currentIndexChanged.connect(
+                lambda c_idx, o=op, cb=action_combo: self._on_user_action_changed(o, cb.itemData(c_idx))
+            )
+            self.preview_table.setCellWidget(row, 2, action_combo)
+
             self.preview_table.setItem(row, 3, QTableWidgetItem(format_bytes(op.size_bytes)))
             self.preview_table.setItem(row, 4, QTableWidgetItem(op.reason))
+
+    def _on_user_action_changed(self, op: PlannedOperation, new_action: PlanAction):
+        """Allows user to manually override planned action for any specific file."""
+        if not new_action:
+            return
+        op.action = new_action
+        if new_action == PlanAction.SKIP:
+            op.reason = "Пропущено вручну користувачем"
+        elif new_action == PlanAction.COPY:
+            op.reason = "Примусове копіювання (вручну)"
+        elif new_action == PlanAction.UPDATE:
+            op.reason = "Примусове оновлення (вручну)"
+        elif new_action == PlanAction.PRESERVE:
+            op.reason = "Захищено користувачем"
 
     def _execute_active_plan(self):
         if not self.current_plan or not self.active_profile:
@@ -875,6 +1016,11 @@ class MainWindow(QMainWindow):
                 self.status_lbl.setText(tr("status_ready"))
                 self.status_lbl.setStyleSheet("color: #57f287; font-weight: bold; padding: 6px;")
                 QMessageBox.information(self, "Готово", tr("sync_completed").format(status=status.value))
+
+                # Automatically re-evaluate plan against new disk state!
+                # Successfully synced files become SKIP (Up-to-date)
+                self._run_profile_preview(self.active_profile, notify=False)
+
             except Exception as e:
                 self.status_lbl.setText(tr("status_error"))
                 self.status_lbl.setStyleSheet("color: #ed4245; font-weight: bold; padding: 6px;")
@@ -897,7 +1043,10 @@ class MainWindow(QMainWindow):
 
         self.conflicts_table = QTableWidget(0, 3)
         self.conflicts_table.setHorizontalHeaderLabels([tr("source_file"), "Розмір / Час", tr("resolution")])
-        self.conflicts_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.conflicts_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.conflicts_table.horizontalHeader().setStretchLastSection(True)
+        self.conflicts_table.setColumnWidth(0, 450)
+        self.conflicts_table.setColumnWidth(1, 150)
         layout.addWidget(self.conflicts_table)
 
         btn_box = QHBoxLayout()
@@ -952,11 +1101,20 @@ class MainWindow(QMainWindow):
         header.setStyleSheet("font-size: 24px; font-weight: bold;")
         layout.addWidget(header)
 
-        self.history_table = QTableWidget(0, 5)
+        self.history_table = QTableWidget(0, 6)
         self.history_table.setHorizontalHeaderLabels([
-            tr("job_time"), tr("history_profile"), tr("job_status"), tr("files_count"), tr("bytes_count")
+            tr("job_time"), tr("history_profile"), tr("job_status"), tr("files_count"), tr("bytes_count"), tr("history_details")
         ])
-        self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        
+        # Interactive columns with comfortable minimums
+        h_hdr = self.history_table.horizontalHeader()
+        h_hdr.setSectionResizeMode(QHeaderView.Interactive)
+        h_hdr.setStretchLastSection(True)
+        self.history_table.setColumnWidth(0, 180)  # Time
+        self.history_table.setColumnWidth(1, 240)  # Profile name
+        self.history_table.setColumnWidth(2, 120)  # Status
+        self.history_table.setColumnWidth(3, 110)  # Files count
+        self.history_table.setColumnWidth(4, 120)  # Bytes count
         layout.addWidget(self.history_table)
 
         self.stack.addWidget(page)
@@ -968,13 +1126,17 @@ class MainWindow(QMainWindow):
             row = self.history_table.rowCount()
             self.history_table.insertRow(row)
             self.history_table.setItem(row, 0, QTableWidgetItem(str(j.get("started_at"))))
-            self.history_table.setItem(row, 1, QTableWidgetItem(j.get("profile_id", "")))
+            
+            # Show friendly profile name
+            prof_name = j.get("profile_name") or j.get("profile_id", "")
+            self.history_table.setItem(row, 1, QTableWidgetItem(prof_name))
             
             st_item = QTableWidgetItem(j.get("status", "").upper())
             st_item.setForeground(QColor("#57f287") if j.get("status") == "success" else QColor("#ed4245"))
             self.history_table.setItem(row, 2, st_item)
             self.history_table.setItem(row, 3, QTableWidgetItem(str(j.get("files_processed", 0))))
             self.history_table.setItem(row, 4, QTableWidgetItem(format_bytes(j.get("bytes_transferred", 0))))
+            self.history_table.setItem(row, 5, QTableWidgetItem(j.get("notes") or "Успішно виконано"))
 
     # --- Page 8: Settings ---
     def _build_settings_page(self):
@@ -990,7 +1152,6 @@ class MainWindow(QMainWindow):
         group = QGroupBox("Параметри інтерфейсу та продуктивності")
         g_layout = QVBoxLayout(group)
 
-        # Language Selection Dropdown
         lang_row = QHBoxLayout()
         lang_lbl = QLabel(tr("language"))
         self.lang_combo = QComboBox()
@@ -1004,7 +1165,6 @@ class MainWindow(QMainWindow):
         lang_row.addStretch()
         g_layout.addLayout(lang_row)
 
-        # Theme Selection Dropdown
         theme_row = QHBoxLayout()
         theme_lbl = QLabel(tr("theme"))
         self.theme_combo = QComboBox()
@@ -1016,7 +1176,6 @@ class MainWindow(QMainWindow):
         theme_row.addStretch()
         g_layout.addLayout(theme_row)
 
-        # Buffer size dropdown
         buf_row = QHBoxLayout()
         buf_lbl = QLabel(tr("buffer_size"))
         self.buffer_combo = QComboBox()
@@ -1028,7 +1187,6 @@ class MainWindow(QMainWindow):
         buf_row.addStretch()
         g_layout.addLayout(buf_row)
 
-        # Checkboxes
         self.notif_cb = QCheckBox(tr("enable_notifications"))
         self.notif_cb.setChecked(self.settings_repo.get("notifications", "1") == "1")
         g_layout.addWidget(self.notif_cb)
@@ -1043,7 +1201,6 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(group)
 
-        # Buttons
         ctrl_row = QHBoxLayout()
         save_btn = QPushButton(tr("save_settings"))
         save_btn.setProperty("class", "PrimaryBtn")

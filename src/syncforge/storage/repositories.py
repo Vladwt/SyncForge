@@ -341,6 +341,12 @@ class HistoryRepository:
     def list_jobs(self, limit: int = 50) -> List[dict]:
         with self.db.get_connection() as conn:
             rows = conn.execute(
-                "SELECT * FROM job_history ORDER BY started_at DESC LIMIT ?", (limit,)
+                """
+                SELECT j.*, p.name AS profile_name
+                FROM job_history j
+                LEFT JOIN profiles p ON j.profile_id = p.id
+                ORDER BY j.started_at DESC
+                LIMIT ?
+                """, (limit,)
             ).fetchall()
             return [dict(r) for r in rows]
