@@ -13,6 +13,7 @@ class RuleType(str, Enum):
     MAX_SIZE = "max_size"
     MIN_SIZE = "min_size"
     ROUTE_FOLDER = "route_folder"
+    ROUTE = "route"
 
 
 @dataclass
@@ -88,7 +89,7 @@ class RuleEngine:
         """
         norm_path = rel_path.replace("\\", "/")
         for rule in self.rules:
-            if not rule.enabled or rule.rule_type != RuleType.ROUTE_FOLDER:
+            if not rule.enabled or rule.rule_type not in (RuleType.ROUTE_FOLDER, RuleType.ROUTE):
                 continue
 
             if self._match_glob(norm_path, rule.pattern):

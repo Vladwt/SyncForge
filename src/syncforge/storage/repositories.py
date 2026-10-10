@@ -7,6 +7,7 @@ from syncforge.core.models import (
     DeviceInfo, DeviceRole, SyncProfile, FolderMapping,
     SyncMode, PlanAction, ExecutionStatus, ConflictResolution
 )
+from syncforge.rules.rule_engine import Rule, RuleType
 from syncforge.storage.database import Database
 
 
@@ -37,7 +38,7 @@ class DeviceRepository:
                     device.filesystem,
                     device.total_bytes,
                     device.free_bytes,
-                    datetime.utcnow()
+                    datetime.now()
                 )
             )
             conn.commit()
@@ -104,7 +105,7 @@ class ProfileRepository:
                     1 if profile.enabled else 0,
                     1 if profile.auto_sync_on_connect else 0,
                     profile.auto_sync_interval_mins,
-                    datetime.utcnow()
+                    datetime.now()
                 )
             )
             # Re-save folder mappings
@@ -164,6 +165,110 @@ class ProfileRepository:
             conn.commit()
 
 
+class RuleRepository:
+    """Manages persistent filtering and routing rules."""
+
+    def __init__(self, db: Database):
+        self.db = db
+        self._ensure_default_rules()
+
+    def _ensure_default_rules(self):
+        """Seed default safety exclusions if table is empty."""
+        with self.db.get_connection() as conn:
+            count = conn.execute("SELECT COUNT(*) FROM rules").fetchone()[0]
+            if count == 0:
+                defaults = [
+                    ("default-1", None, None, "exclude_glob", "*.tmp", None, 100, 1),
+                    ("default-2", None, None, "exclude_glob", "node_modules/**", None, 90, 1),
+                    ("default-3", None, None, "exclude_glob", "target/**", None, 80, 1),
+                    ("default-4", None, None, "exclude_glob", ".git/**", None, 110, 1),
+                    ("default-5", None, None, "route", "*.pdf", "Documents/PDF", 50, 1),
+                ]
+                conn.executemany(
+                    """
+                    INSERT INTO rules (id, profile_id, mapping_id, rule_type, pattern, target_subfolder, priority, enabled)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    defaults
+                )
+                conn.commit()
+
+    def list_rules(self, profile_id: Optional[str] = None) -> List[Rule]:
+        with self.db.get_connection() as conn:
+            if profile_id:
+                rows = conn.execute(
+                    "SELECT * FROM rules WHERE profile_id = ? OR profile_id IS NULL ORDER BY priority DESC",
+                    (profile_id,)
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM rules ORDER BY priority DESC").fetchall()
+
+            rules = []
+            for r in rows:
+                rt = RuleType.EXCLUDE_GLOB
+                for t in RuleType:
+                    if t.value == r["rule_type"]:
+                        rt = t
+                        break
+                rules.append(Rule(
+                    id=r["id"],
+                    rule_type=rt,
+                    pattern=r["pattern"],
+                    target_subfolder=r["target_subfolder"],
+                    priority=r["priority"],
+                    enabled=bool(r["enabled"])
+                ))
+            return rules
+
+    def save_rule(self, rule: Rule, profile_id: Optional[str] = None):
+        with self.db.get_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO rules (id, profile_id, rule_type, pattern, target_subfolder, priority, enabled)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    rule.id,
+                    profile_id,
+                    rule.rule_type.value,
+                    rule.pattern,
+                    rule.target_subfolder,
+                    rule.priority,
+                    1 if rule.enabled else 0
+                )
+            )
+            conn.commit()
+
+    def delete_rule(self, rule_id: str):
+        with self.db.get_connection() as conn:
+            conn.execute("DELETE FROM rules WHERE id = ?", (rule_id,))
+            conn.commit()
+
+
+class SettingsRepository:
+    """Manages application key-value settings."""
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def get(self, key: str, default: str = "") -> str:
+        with self.db.get_connection() as conn:
+            row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+            return row["value"] if row else default
+
+    def set(self, key: str, value: str):
+        with self.db.get_connection() as conn:
+            conn.execute("INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)", (key, str(value)))
+            conn.commit()
+
+    def clear_all_history(self):
+        """Cleans history and operation audit records."""
+        with self.db.get_connection() as conn:
+            conn.execute("DELETE FROM operation_records")
+            conn.execute("DELETE FROM job_history")
+            conn.commit()
+
+
 class BaselineRepository:
     """Stores previous synchronization baselines for safe Mode B bidirectional sync."""
 
@@ -179,12 +284,11 @@ class BaselineRepository:
                     profile_id, mapping_id, rel_path, side, size_bytes, mtime_ns, hash_blake3, last_synced_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (profile_id, mapping_id, rel_path, side, size_bytes, mtime_ns, hash_blake3, datetime.utcnow())
+                (profile_id, mapping_id, rel_path, side, size_bytes, mtime_ns, hash_blake3, datetime.now())
             )
             conn.commit()
 
     def get_baseline(self, profile_id: str, mapping_id: str) -> Dict[str, Dict[str, dict]]:
-        """Returns {rel_path: {'source': {...}, 'dest': {...}}}"""
         with self.db.get_connection() as conn:
             rows = conn.execute(
                 "SELECT * FROM baselines WHERE profile_id = ? AND mapping_id = ?",

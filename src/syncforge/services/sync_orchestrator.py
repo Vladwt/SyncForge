@@ -34,13 +34,13 @@ class SyncOrchestrator:
         self.planner = planner or SyncPlanner(baseline_repo=baseline_repo)
         self.engine = engine or TransferEngine(baseline_repo=baseline_repo, history_repo=history_repo)
 
-    def prepare_dry_run(self, profile: SyncProfile) -> List[PlannedOperation]:
+    def prepare_dry_run(self, profile: SyncProfile, rule_engine: Optional[object] = None) -> List[PlannedOperation]:
         """
         Generates a dry-run plan.
         Enforces strict safety check: verifies target device before generating plan.
         """
         active_dest_root = self._resolve_and_verify_dest_root(profile)
-        return self.planner.generate_plan(profile, active_dest_root)
+        return self.planner.generate_plan(profile, active_dest_root, rule_engine=rule_engine)
 
     def execute_sync(
         self,
