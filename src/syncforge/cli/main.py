@@ -3,6 +3,7 @@
 import sys
 import argparse
 from pathlib import Path
+from syncforge.services.logger_config import configure_logging
 from syncforge.storage.database import Database
 from syncforge.storage.repositories import ProfileRepository, DeviceRepository, BaselineRepository, HistoryRepository
 from syncforge.devices.device_service import DeviceService
@@ -11,6 +12,7 @@ from syncforge.core.models import SyncProfile, SyncMode, FolderMapping
 
 
 def main():
+    configure_logging()
     parser = argparse.ArgumentParser(description="SyncForge Diagnostics & CLI Tool")
     subparsers = parser.add_subparsers(dest="command")
 

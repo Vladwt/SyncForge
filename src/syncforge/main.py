@@ -2,11 +2,14 @@
 
 import sys
 from PySide6.QtWidgets import QApplication
+from syncforge.services.logger_config import configure_logging
 from syncforge.gui.main_window import MainWindow
 
 
 def main():
     """Starts the native PySide6 desktop GUI."""
+    configure_logging()
+
     app = QApplication(sys.argv)
     app.setApplicationName("SyncForge")
     app.setOrganizationName("SyncForge")
