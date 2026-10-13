@@ -80,7 +80,10 @@ class FileComparator:
                 if m1.abs_path and m2.abs_path and Path(m1.abs_path).exists() and Path(m2.abs_path).exists():
                     s1 = compute_sample_hash(Path(m1.abs_path), sample_size=sample_kb * 1024)
                     s2 = compute_sample_hash(Path(m2.abs_path), sample_size=sample_kb * 1024)
-                    return s1 == s2
+                    if s1 and s2:
+                        return s1 == s2
+                    # If either file could not be read (e.g. read error / device error), fall back to timestamp check
+                    return mtime_diff_sec <= mtime_tol
                 return True
             else:
                 # Different timestamps with equal size

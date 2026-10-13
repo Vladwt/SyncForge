@@ -82,7 +82,7 @@ class PreviewScanWorker(QThread):
                 self.progress.emit(100, "Аналіз завершено")
                 self.scan_finished.emit(all_ops, None)
         except Exception as e:
-            logger.error("Preview scan worker encountered error", error=str(e))
+            logger.exception("Preview scan worker encountered error", error=str(e))
             self.scan_error.emit(str(e))
 
     def _emit_progress(self, percent: int, msg: str):

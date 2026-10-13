@@ -20,34 +20,38 @@ def compute_blake3_hash(
     Computes a streaming BLAKE3 hexadecimal hash of a file.
     Supports I/O rate limiting and sleep yields between chunks to protect
     external SSDs/HDDs from thermal overload and bus disconnection.
+    Safely handles unreadable/corrupted/locked files without crashing.
     """
     hasher = blake3.blake3()
     bytes_read_total = 0
     start_time = time.perf_counter()
 
-    with open(str(file_path), "rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
-            hasher.update(chunk)
-            bytes_read_total += len(chunk)
+    try:
+        with open(str(file_path), "rb") as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+                bytes_read_total += len(chunk)
 
-            if progress_callback:
-                progress_callback(len(chunk))
+                if progress_callback:
+                    progress_callback(len(chunk))
 
-            # I/O throttling: yield delay between chunks
-            if yield_delay_ms > 0:
-                time.sleep(yield_delay_ms / 1000.0)
+                # I/O throttling: yield delay between chunks
+                if yield_delay_ms > 0:
+                    time.sleep(yield_delay_ms / 1000.0)
 
-            # I/O rate limiting: speed cap in MB/s
-            if speed_limit_mb > 0:
-                target_sec = (bytes_read_total / (speed_limit_mb * 1024 * 1024))
-                elapsed_sec = time.perf_counter() - start_time
-                if elapsed_sec < target_sec:
-                    time.sleep(target_sec - elapsed_sec)
+                # I/O rate limiting: speed cap in MB/s
+                if speed_limit_mb > 0:
+                    target_sec = (bytes_read_total / (speed_limit_mb * 1024 * 1024))
+                    elapsed_sec = time.perf_counter() - start_time
+                    if elapsed_sec < target_sec:
+                        time.sleep(target_sec - elapsed_sec)
 
-    return hasher.hexdigest()
+        return hasher.hexdigest()
+    except (OSError, IOError, PermissionError):
+        return ""
 
 
 def compute_sample_hash(
@@ -57,23 +61,23 @@ def compute_sample_hash(
     """
     Computes a fast heuristic BLAKE3 hash of file head and tail (up to sample_size each).
     Requires minimal I/O (reads <= 128 KiB regardless of file size).
+    Safely returns empty string if the file is unreadable (e.g. disk sector error, lock, or disconnect).
     """
     hasher = blake3.blake3()
     try:
         file_size = os.path.getsize(str(file_path))
-    except OSError:
+        with open(str(file_path), "rb") as f:
+            head = f.read(sample_size)
+            hasher.update(head)
+
+            if file_size > sample_size * 2:
+                try:
+                    f.seek(file_size - sample_size)
+                    tail = f.read(sample_size)
+                    hasher.update(tail)
+                except (OSError, ValueError):
+                    pass
+
+        return hasher.hexdigest()
+    except (OSError, IOError, PermissionError):
         return ""
-
-    with open(str(file_path), "rb") as f:
-        head = f.read(sample_size)
-        hasher.update(head)
-
-        if file_size > sample_size * 2:
-            try:
-                f.seek(file_size - sample_size)
-                tail = f.read(sample_size)
-                hasher.update(tail)
-            except (OSError, ValueError):
-                pass
-
-    return hasher.hexdigest()
