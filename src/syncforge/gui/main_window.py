@@ -1078,8 +1078,8 @@ class MainWindow(QMainWindow):
                 f"Синхронізацію було зупинено користувачем.\nУспішно скопійовано: {len(successful_ops)} файлів."
             )
         elif failed_ops:
-            self.status_lbl.setText(tr("status_error"))
-            self.status_lbl.setStyleSheet("color: #ed4245; font-weight: bold; padding: 6px;")
+            self.status_lbl.setText(f"Завершено: {len(successful_ops)} успішно, {len(failed_ops)} помилок")
+            self.status_lbl.setStyleSheet("color: #faa61a; font-weight: bold; padding: 6px;")
 
             first_errors = []
             for op in failed_ops[:10]:
@@ -1089,12 +1089,12 @@ class MainWindow(QMainWindow):
             err_summary = "\n".join(first_errors) + more_text
 
             msg_box = QMessageBox(self)
-            msg_box.setIcon(QMessageBox.Critical)
-            msg_box.setWindowTitle("Помилка виконання синхронізації")
+            msg_box.setIcon(QMessageBox.Warning if successful_ops else QMessageBox.Critical)
+            msg_box.setWindowTitle("Синхронізацію завершено з окремими помилками")
             msg_box.setText(
-                f"Синхронізацію завершено з помилками!\n\n"
+                f"Синхронізація продовжувалася для всіх доступних файлів!\n\n"
                 f"Успішно скопійовано: {len(successful_ops)}\n"
-                f"Помилок (диск відключено або файл недоступний): {len(failed_ops)}\n\n"
+                f"Пропущено через помилки (файл зайнятий / пошкоджений): {len(failed_ops)}\n\n"
                 f"Деталі (перші помилки):\n{err_summary}"
             )
             msg_box.exec()

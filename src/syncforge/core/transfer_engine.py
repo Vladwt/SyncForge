@@ -194,39 +194,29 @@ class TransferEngine:
                 op.error_message = str(e)
                 errors_count += 1
 
-                # Detect hardware / device disconnection or I/O failure
+                # Detect genuine hardware / device disconnection:
+                # Check whether the drive root / anchor is actually disconnected from the system.
                 is_device_disconnected = False
-                winerr = getattr(e, "winerror", None)
-                errno_val = getattr(e, "errno", None)
-
-                # Check for known Windows I/O error codes (1117, 1167, 15, 21, 433) or Errno 22 (EINVAL) during drive reset
-                if winerr in (1117, 1167, 15, 21, 433):
-                    is_device_disconnected = True
-                else:
-                    # Check if destination root is still accessible
-                    try:
-                        dst_root_check = Path(op.dest_abs).anchor if op.dest_abs else (profile.dest_root or "")
-                        if dst_root_check and not Path(dst_root_check).exists():
-                            is_device_disconnected = True
-                    except Exception:
+                try:
+                    dst_root_check = Path(op.dest_abs).anchor if op.dest_abs else (profile.dest_root or "")
+                    if dst_root_check and not Path(dst_root_check).exists():
                         is_device_disconnected = True
+                except Exception:
+                    is_device_disconnected = True
 
-                # Also abort if multiple consecutive write failures occur (drive unresponsive)
-                if not hasattr(self, "_consecutive_errors"):
-                    self._consecutive_errors = 0
-                self._consecutive_errors += 1
-
-                if is_device_disconnected or self._consecutive_errors >= 5:
-                    reason_msg = f"Накопичувач відключено або апаратний збій I/O ({e})" if is_device_disconnected else f"Серія з {self._consecutive_errors} критичних помилок I/O поспіль ({e})"
-                    logger.critical("Target drive disconnected or unresponsive! Aborting remaining operations.", error=str(e))
-                    progress.status_text = f"Помилка вводу/виводу: накопичувач відключено або збій ({e})"
+                if is_device_disconnected:
+                    reason_msg = f"Цільовий накопичувач відключено ({e})"
+                    logger.critical("Target drive disconnected! Aborting remaining operations.", error=str(e))
+                    progress.status_text = f"Помилка вводу/виводу: накопичувач відключено ({e})"
                     self.last_abort_reason = reason_msg
                     progress.completed_operations += 1
                     if progress_callback:
                         progress_callback(progress)
                     return ExecutionStatus.FAILED
-            else:
-                self._consecutive_errors = 0
+
+                # For individual file errors (WinError 433 sector corruption, PermissionError, sharing violations, etc.):
+                # Continue transferring the remaining files so the rest of the batch succeeds!
+                logger.warning("Skipping failed file and continuing sync for remaining files", op=op.rel_path, error=str(e))
 
             # Inter-file yield delay if configured
             if yield_delay_s > 0:
