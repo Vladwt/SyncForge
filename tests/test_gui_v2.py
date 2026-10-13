@@ -206,3 +206,75 @@ def test_preview_scan_worker_thread_and_progress(tmp_path, qtbot):
     win.watcher.stop()
     win.close()
 
+
+def test_bulk_action_for_visible_files(tmp_path, qtbot, monkeypatch):
+    """Verifies that selecting and applying a bulk action updates all visible/filtered items."""
+    from syncforge.core.models import PlannedOperation, PlanAction
+    from PySide6.QtWidgets import QMessageBox
+
+    db = Database(tmp_path / "test_bulk_action.db")
+    win = MainWindow(db=db)
+    qtbot.addWidget(win)
+
+    try:
+        # Create mock planned operations
+        ops = [
+            PlannedOperation(
+                id=f"op_{i}",
+                profile_id="prof_1",
+                mapping_id="map_1",
+                rel_path=f"file_{i}.txt",
+                action=PlanAction.COPY,
+                size_bytes=100,
+                source_abs=f"C:/src/file_{i}.txt",
+                dest_abs=f"D:/dst/file_{i}.txt",
+                reason="Новий файл"
+            )
+            for i in range(15)
+        ]
+        win.current_plan = ops
+        win.preview_page.set_plan(ops, None, is_all=True)
+
+        assert win.preview_page.table.rowCount() == 15
+        assert win.preview_page._displayed_preview_ops == ops
+        assert "15 видимих файлів" in win.preview_page.bulk_count_lbl.text()
+
+        # Monkeypatch QMessageBox.question to automatically confirm Yes
+        monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: QMessageBox.Yes)
+
+        # Select bulk action PRESERVE ("Залишити тільки на SSD")
+        idx = win.preview_page.bulk_action_combo.findData(PlanAction.PRESERVE)
+        assert idx >= 0
+        win.preview_page.bulk_action_combo.setCurrentIndex(idx)
+
+        # Apply bulk action
+        win.preview_page._apply_bulk_action_to_visible()
+
+        # Check all ops have updated action and reason
+        for op in win.current_plan:
+            assert op.action == PlanAction.PRESERVE
+            assert "Залишити тільки на SSD" in op.reason
+
+        # Now filter by query (e.g. only file_1, file_10..file_14)
+        win.preview_page.search_edit.setText("file_1")
+        visible_subset = win.preview_page._displayed_preview_ops
+        assert len(visible_subset) == 6  # file_1, file_10, file_11, file_12, file_13, file_14
+
+        # Select bulk action SKIP for the visible subset
+        skip_idx = win.preview_page.bulk_action_combo.findData(PlanAction.SKIP)
+        assert skip_idx >= 0
+        win.preview_page.bulk_action_combo.setCurrentIndex(skip_idx)
+        win.preview_page._apply_bulk_action_to_visible()
+
+        for op in visible_subset:
+            assert op.action == PlanAction.SKIP
+
+        # Other files remain PRESERVE
+        file_0 = next(op for op in win.current_plan if op.rel_path == "file_0.txt")
+        assert file_0.action == PlanAction.PRESERVE
+
+    finally:
+        win.watcher.stop()
+        win.close()
+
+

@@ -170,6 +170,13 @@ TRANSLATIONS = {
         "action_delete_dest_choice": "Видалити також із SSD",
         "action_ignore_choice": "Ігнорувати (виключити правилом)",
 
+        # Bulk visible actions
+        "bulk_action_title": "Дія для всіх видимих:",
+        "bulk_action_placeholder": "— Обрати дію для всіх видимих —",
+        "bulk_apply_btn": "Застосувати до видимих",
+        "bulk_confirm_title": "Масове застосування дії",
+        "bulk_confirm_msg": "Застосувати дію '{action}' для {count} видимих файлів?",
+
         # Plan staleness and confirmation
         "plan_stale_title": "План синхронізації застарів",
         "plan_stale_msg": "Виявлено зміни у файлах або накопичувачі після створення плану.\n\nПлан буде автоматично оновлено для безпеки ваших даних.",
@@ -372,6 +379,13 @@ TRANSLATIONS = {
         "action_archive_dest": "Archive copy on SSD",
         "action_delete_dest_choice": "Delete on SSD as well",
         "action_ignore_choice": "Ignore (exclude by rule)",
+
+        # Bulk visible actions
+        "bulk_action_title": "Action for all visible:",
+        "bulk_action_placeholder": "— Select action for all visible —",
+        "bulk_apply_btn": "Apply to visible",
+        "bulk_confirm_title": "Bulk Action Confirmation",
+        "bulk_confirm_msg": "Apply action '{action}' to {count} visible files?",
 
         # Plan staleness and confirmation
         "plan_stale_title": "Sync Plan is Stale",

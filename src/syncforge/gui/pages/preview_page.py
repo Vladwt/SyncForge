@@ -108,6 +108,37 @@ class PreviewPage(QWidget):
         top_ctrl.addStretch()
         layout.addLayout(top_ctrl)
 
+        # Bulk action row for visible files
+        bulk_row = QHBoxLayout()
+        bulk_row.setSpacing(10)
+        bulk_lbl = QLabel(f"⚡ {tr('bulk_action_title')}")
+        bulk_lbl.setStyleSheet("font-weight: bold; color: #5865f2;")
+        bulk_row.addWidget(bulk_lbl)
+
+        self.bulk_action_combo = QComboBox()
+        self.bulk_action_combo.setMinimumWidth(260)
+        self.bulk_action_combo.addItem(tr("bulk_action_placeholder"), None)
+        self.bulk_action_combo.addItem(f"🛡️ {tr('action_keep_dest')}", PlanAction.PRESERVE)
+        self.bulk_action_combo.addItem(f"📥 {tr('action_restore_pc')}", PlanAction.RESTORE)
+        self.bulk_action_combo.addItem(f"📦 {tr('action_archive_dest')}", PlanAction.ARCHIVE)
+        self.bulk_action_combo.addItem(f"⏩ {tr('action_skip')}", PlanAction.SKIP)
+        self.bulk_action_combo.addItem(f"📋 {tr('action_copy')}", PlanAction.COPY)
+        self.bulk_action_combo.addItem(f"🔄 {tr('action_update')}", PlanAction.UPDATE)
+        self.bulk_action_combo.addItem(f"🚫 {tr('action_ignore_choice')}", PlanAction.IGNORE)
+        self.bulk_action_combo.addItem(f"🗑️ {tr('action_delete_dest_choice')}", PlanAction.DELETE_DEST)
+        bulk_row.addWidget(self.bulk_action_combo)
+
+        self.bulk_apply_btn = QPushButton(f"✅ {tr('bulk_apply_btn')}")
+        self.bulk_apply_btn.clicked.connect(self._apply_bulk_action_to_visible)
+        bulk_row.addWidget(self.bulk_apply_btn)
+
+        self.bulk_count_lbl = QLabel("")
+        self.bulk_count_lbl.setStyleSheet("color: #949ba4; font-size: 12px;")
+        bulk_row.addWidget(self.bulk_count_lbl)
+
+        bulk_row.addStretch()
+        layout.addLayout(bulk_row)
+
         self.summary_lbl = QLabel(tr("no_plan_notice"))
         self.summary_lbl.setStyleSheet("color: #949ba4; font-weight: 500;")
         layout.addWidget(self.summary_lbl)
@@ -152,6 +183,8 @@ class PreviewPage(QWidget):
         self.exec_btn.setEnabled(not is_syncing)
         self.rescan_btn.setEnabled(not is_syncing)
         self.profile_combo.setEnabled(not is_syncing)
+        self.bulk_apply_btn.setEnabled(not is_syncing and bool(self._displayed_preview_ops))
+        self.bulk_action_combo.setEnabled(not is_syncing)
 
         self.pause_btn.setEnabled(is_syncing)
         self.stop_btn.setEnabled(is_syncing)
@@ -284,6 +317,14 @@ class PreviewPage(QWidget):
 
             self.table.setRowCount(len(filtered_ops))
             self._displayed_preview_ops = [op for op, _ in filtered_ops]
+
+            # Update bulk count label
+            if filtered_ops:
+                self.bulk_count_lbl.setText(f"({len(filtered_ops)} видимих файлів)")
+                self.bulk_apply_btn.setEnabled(True)
+            else:
+                self.bulk_count_lbl.setText("(0 файлів)")
+                self.bulk_apply_btn.setEnabled(False)
 
             for row, (op, p_name) in enumerate(filtered_ops):
                 prof_item = QTableWidgetItem(p_name or "—")
@@ -427,3 +468,89 @@ class PreviewPage(QWidget):
             if (dest_item and op.rel_path in dest_item.text()) or (src_item and op.rel_path in src_item.text()):
                 self.table.setItem(r, 5, QTableWidgetItem(op.reason))
                 break
+
+    def _apply_bulk_action_to_visible(self):
+        """Applies chosen PlanAction to all currently filtered/visible operations in the preview table."""
+        raw_action = self.bulk_action_combo.currentData()
+        if not raw_action or not self._displayed_preview_ops:
+            return
+
+        try:
+            action = PlanAction(raw_action)
+        except Exception:
+            return
+
+        action_text = self.bulk_action_combo.currentText()
+        count = len(self._displayed_preview_ops)
+
+        if action == PlanAction.DELETE_DEST:
+            reply = QMessageBox.warning(
+                self,
+                tr("confirm_delete_dest_title"),
+                f"УВАГА: Ви збираєтеся видалити {count} файлів з накопичувача (SSD)!\n\nЦю дію неможливо скасувати. Продовжити?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+        else:
+            reply = QMessageBox.question(
+                self,
+                tr("bulk_confirm_title"),
+                tr("bulk_confirm_msg").format(action=action_text, count=count),
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        reason_map = {
+            PlanAction.PRESERVE: "Залишити тільки на SSD (масове рішення)",
+            PlanAction.RESTORE: "Відновлення з SSD на ПК (масове рішення)",
+            PlanAction.ARCHIVE: "Переміщення в архів на SSD (масове рішення)",
+            PlanAction.SKIP: "Пропущено масово користувачем",
+            PlanAction.COPY: "Примусове копіювання (масово)",
+            PlanAction.UPDATE: "Примусове оновлення (масово)",
+            PlanAction.IGNORE: "Ігнорувати (масово)",
+            PlanAction.DELETE_DEST: "Підтверджено: масове видалення з SSD",
+        }
+        val_str = getattr(action, "value", str(action))
+        bulk_reason = reason_map.get(action, f"Змінено дію на {val_str}")
+
+        for op in self._displayed_preview_ops:
+            if op.action == PlanAction.ERROR:
+                continue
+            op.action = action
+            op.reason = bulk_reason
+
+        # Re-filter and refresh display table and header counts
+        self.filter_preview_table()
+        self._update_summary_counts()
+
+    def _update_summary_counts(self):
+        """Refreshes summary label counts after manual or bulk action overrides."""
+        if not self._current_plan:
+            return
+        error_ops = [op for op in self._current_plan if op.action == PlanAction.ERROR]
+        pending_ops = [op for op in self._current_plan if op.action not in (PlanAction.SKIP, PlanAction.IGNORE, PlanAction.ERROR)]
+        total_bytes = sum(op.size_bytes for op in pending_ops if op.action in (PlanAction.COPY, PlanAction.UPDATE, PlanAction.RESTORE))
+        skip_count = len(self._current_plan) - len(pending_ops)
+
+        curr_text = self.summary_lbl.text()
+        prof_part = curr_text.split("|")[0].strip() if "|" in curr_text else "Профіль:"
+        free_part = curr_text.split("Вільно на цілі:")[-1].strip() if "Вільно на цілі:" in curr_text else "—"
+
+        if error_ops:
+            self.summary_lbl.setText(
+                f"{prof_part} | ⚠️ УВАГА: {len(error_ops)} помилок конфігурації!"
+            )
+            self.summary_lbl.setStyleSheet("color: #ed4245; font-weight: bold;")
+        elif pending_ops:
+            self.summary_lbl.setText(
+                f"{prof_part} | До виконання: {len(pending_ops)} дій ({format_bytes(total_bytes)}) | Актуальних/пропущених: {skip_count} | Вільно на цілі: {free_part}"
+            )
+            self.summary_lbl.setStyleSheet("color: #f2f3f5; font-weight: 500;")
+        else:
+            self.summary_lbl.setText(
+                f"{prof_part} | Всі файли актуальні / пропущені ({skip_count}) | Вільно на цілі: {free_part}"
+            )
+            self.summary_lbl.setStyleSheet("color: #57f287; font-weight: 500;")
+
