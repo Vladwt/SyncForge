@@ -1,11 +1,13 @@
 """Repositories for storing and retrieving persistent state in SyncForge."""
 
 import json
+import uuid
 from datetime import datetime
 from typing import List, Optional, Dict
 from syncforge.core.models import (
     DeviceInfo, DeviceRole, SyncProfile, FolderMapping,
-    SyncMode, PlanAction, ExecutionStatus, ConflictResolution
+    SyncMode, PlanAction, ExecutionStatus, ConflictResolution,
+    PlannedOperation, DeletionPolicy, AnalysisMode
 )
 from syncforge.rules.rule_engine import Rule, RuleType
 from syncforge.storage.database import Database
@@ -83,14 +85,26 @@ class ProfileRepository:
 
     def save_profile(self, profile: SyncProfile):
         with self.db.get_connection() as conn:
+            del_policy_val = (
+                profile.deletion_policy.value
+                if hasattr(profile.deletion_policy, "value")
+                else str(profile.deletion_policy)
+            )
+            analysis_mode_val = (
+                profile.analysis_mode.value
+                if hasattr(profile.analysis_mode, "value")
+                else str(profile.analysis_mode)
+            )
             conn.execute(
                 """
                 INSERT OR REPLACE INTO profiles (
                     id, name, mode, target_device_id, dest_root,
                     preserve_versions, max_versions, version_subfolder,
-                    verify_hashes, enabled, auto_sync_on_connect,
-                    auto_sync_interval_mins, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    verify_hashes, analysis_mode, io_yield_delay_ms,
+                    io_speed_limit_mb, io_buffer_size_kb, mtime_tolerance_sec,
+                    balanced_sample_size_kb, enabled, auto_sync_on_connect,
+                    auto_sync_interval_mins, deletion_policy, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     profile.id,
@@ -102,9 +116,16 @@ class ProfileRepository:
                     profile.max_versions,
                     profile.version_subfolder,
                     1 if profile.verify_hashes else 0,
+                    analysis_mode_val,
+                    float(getattr(profile, "io_yield_delay_ms", 0.0)),
+                    float(getattr(profile, "io_speed_limit_mb", 0.0)),
+                    int(getattr(profile, "io_buffer_size_kb", 128)),
+                    float(getattr(profile, "mtime_tolerance_sec", 2.0)),
+                    int(getattr(profile, "balanced_sample_size_kb", 64)),
                     1 if profile.enabled else 0,
                     1 if profile.auto_sync_on_connect else 0,
                     profile.auto_sync_interval_mins,
+                    del_policy_val,
                     datetime.now()
                 )
             )
@@ -138,6 +159,23 @@ class ProfileRepository:
                     custom_rules_id=m["custom_rules_id"]
                 ) for m in mappings_rows
             ]
+
+            del_pol_str = "preserve_all"
+            if "deletion_policy" in row.keys() and row["deletion_policy"]:
+                del_pol_str = row["deletion_policy"]
+            try:
+                del_policy = DeletionPolicy(del_pol_str)
+            except Exception:
+                del_policy = DeletionPolicy.PRESERVE_ALL
+
+            analysis_mode_str = "balanced"
+            if "analysis_mode" in row.keys() and row["analysis_mode"]:
+                analysis_mode_str = row["analysis_mode"]
+            try:
+                analysis_mode = AnalysisMode(analysis_mode_str)
+            except Exception:
+                analysis_mode = AnalysisMode.BALANCED
+
             return SyncProfile(
                 id=row["id"],
                 name=row["name"],
@@ -149,9 +187,16 @@ class ProfileRepository:
                 max_versions=row["max_versions"],
                 version_subfolder=row["version_subfolder"],
                 verify_hashes=bool(row["verify_hashes"]),
+                analysis_mode=analysis_mode,
+                io_yield_delay_ms=float(row["io_yield_delay_ms"]) if "io_yield_delay_ms" in row.keys() and row["io_yield_delay_ms"] is not None else 0.0,
+                io_speed_limit_mb=float(row["io_speed_limit_mb"]) if "io_speed_limit_mb" in row.keys() and row["io_speed_limit_mb"] is not None else 0.0,
+                io_buffer_size_kb=int(row["io_buffer_size_kb"]) if "io_buffer_size_kb" in row.keys() and row["io_buffer_size_kb"] is not None else 128,
+                mtime_tolerance_sec=float(row["mtime_tolerance_sec"]) if "mtime_tolerance_sec" in row.keys() and row["mtime_tolerance_sec"] is not None else 2.0,
+                balanced_sample_size_kb=int(row["balanced_sample_size_kb"]) if "balanced_sample_size_kb" in row.keys() and row["balanced_sample_size_kb"] is not None else 64,
                 enabled=bool(row["enabled"]),
                 auto_sync_on_connect=bool(row["auto_sync_on_connect"]),
                 auto_sync_interval_mins=row["auto_sync_interval_mins"],
+                deletion_policy=del_policy,
             )
 
     def list_profiles(self) -> List[SyncProfile]:
@@ -163,6 +208,156 @@ class ProfileRepository:
         with self.db.get_connection() as conn:
             conn.execute("DELETE FROM profiles WHERE id = ?", (profile_id,))
             conn.commit()
+
+    def export_profiles(self, file_path: str, profile_ids: Optional[List[str]] = None) -> int:
+        """Exports profiles, mappings, and associated rules to a JSON file."""
+        all_profs = self.list_profiles()
+        if profile_ids:
+            export_list = [p for p in all_profs if p.id in profile_ids]
+        else:
+            export_list = all_profs
+
+        rule_repo = RuleRepository(self.db)
+        exported_data = {
+            "version": "1.0",
+            "app": "SyncForge",
+            "exported_at": datetime.now().isoformat(),
+            "profiles": []
+        }
+
+        for p in export_list:
+            p_rules = rule_repo.list_rules(profile_id=p.id)
+            prof_dict = {
+                "id": p.id,
+                "name": p.name,
+                "mode": p.mode.value if hasattr(p.mode, "value") else str(p.mode),
+                "target_device_id": p.target_device_id,
+                "dest_root": p.dest_root,
+                "preserve_versions": p.preserve_versions,
+                "max_versions": p.max_versions,
+                "version_subfolder": p.version_subfolder,
+                "verify_hashes": p.verify_hashes,
+                "analysis_mode": p.analysis_mode.value if hasattr(p.analysis_mode, "value") else str(p.analysis_mode),
+                "io_yield_delay_ms": p.io_yield_delay_ms,
+                "io_speed_limit_mb": p.io_speed_limit_mb,
+                "io_buffer_size_kb": p.io_buffer_size_kb,
+                "mtime_tolerance_sec": p.mtime_tolerance_sec,
+                "balanced_sample_size_kb": p.balanced_sample_size_kb,
+                "enabled": p.enabled,
+                "auto_sync_on_connect": p.auto_sync_on_connect,
+                "auto_sync_interval_mins": p.auto_sync_interval_mins,
+                "deletion_policy": p.deletion_policy.value if hasattr(p.deletion_policy, "value") else str(p.deletion_policy),
+                "mappings": [
+                    {
+                        "id": m.id,
+                        "source_root": m.source_root,
+                        "dest_subpath": m.dest_subpath,
+                        "enabled": m.enabled,
+                        "custom_rules_id": m.custom_rules_id
+                    }
+                    for m in p.mappings
+                ],
+                "rules": [
+                    {
+                        "id": r.id,
+                        "rule_type": r.rule_type.value if hasattr(r.rule_type, "value") else str(r.rule_type),
+                        "pattern": r.pattern,
+                        "target_subfolder": r.target_subfolder,
+                        "priority": r.priority,
+                        "enabled": r.enabled
+                    }
+                    for r in p_rules
+                ]
+            }
+            exported_data["profiles"].append(prof_dict)
+
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(exported_data, f, ensure_ascii=False, indent=2)
+
+        return len(exported_data["profiles"])
+
+    def import_profiles(self, file_path: str) -> int:
+        """Imports profiles, mappings, and rules from a JSON file. Overwrites or adds profiles."""
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        profiles_raw = data.get("profiles", [])
+        rule_repo = RuleRepository(self.db)
+        imported_count = 0
+
+        for p_data in profiles_raw:
+            pid = p_data.get("id") or str(uuid.uuid4())
+            mappings = [
+                FolderMapping(
+                    id=m.get("id") or str(uuid.uuid4()),
+                    profile_id=pid,
+                    source_root=m.get("source_root", ""),
+                    dest_subpath=m.get("dest_subpath", ""),
+                    enabled=bool(m.get("enabled", True)),
+                    custom_rules_id=m.get("custom_rules_id")
+                )
+                for m in p_data.get("mappings", [])
+            ]
+
+            try:
+                mode = SyncMode(p_data.get("mode", SyncMode.ONE_WAY_SAFE.value))
+            except Exception:
+                mode = SyncMode.ONE_WAY_SAFE
+
+            try:
+                analysis_mode = AnalysisMode(p_data.get("analysis_mode", AnalysisMode.BALANCED.value))
+            except Exception:
+                analysis_mode = AnalysisMode.BALANCED
+
+            try:
+                deletion_policy = DeletionPolicy(p_data.get("deletion_policy", DeletionPolicy.PRESERVE_ALL.value))
+            except Exception:
+                deletion_policy = DeletionPolicy.PRESERVE_ALL
+
+            profile = SyncProfile(
+                id=pid,
+                name=p_data.get("name", "Імпортований профіль"),
+                mode=mode,
+                target_device_id=p_data.get("target_device_id"),
+                dest_root=p_data.get("dest_root"),
+                mappings=mappings,
+                preserve_versions=bool(p_data.get("preserve_versions", True)),
+                max_versions=int(p_data.get("max_versions", 10)),
+                version_subfolder=p_data.get("version_subfolder", ".syncforge_versions"),
+                verify_hashes=bool(p_data.get("verify_hashes", True)),
+                analysis_mode=analysis_mode,
+                io_yield_delay_ms=float(p_data.get("io_yield_delay_ms", 0.0)),
+                io_speed_limit_mb=float(p_data.get("io_speed_limit_mb", 0.0)),
+                io_buffer_size_kb=int(p_data.get("io_buffer_size_kb", 128)),
+                mtime_tolerance_sec=float(p_data.get("mtime_tolerance_sec", 2.0)),
+                balanced_sample_size_kb=int(p_data.get("balanced_sample_size_kb", 64)),
+                enabled=bool(p_data.get("enabled", True)),
+                auto_sync_on_connect=bool(p_data.get("auto_sync_on_connect", False)),
+                auto_sync_interval_mins=int(p_data.get("auto_sync_interval_mins", 0)),
+                deletion_policy=deletion_policy
+            )
+            self.save_profile(profile)
+
+            # Import profile-specific rules
+            for r_data in p_data.get("rules", []):
+                try:
+                    rt = RuleType(r_data.get("rule_type", RuleType.EXCLUDE_GLOB.value))
+                except Exception:
+                    rt = RuleType.EXCLUDE_GLOB
+
+                rule = Rule(
+                    id=r_data.get("id") or str(uuid.uuid4()),
+                    rule_type=rt,
+                    pattern=r_data.get("pattern", "*"),
+                    target_subfolder=r_data.get("target_subfolder"),
+                    priority=int(r_data.get("priority", 0)),
+                    enabled=bool(r_data.get("enabled", True))
+                )
+                rule_repo.save_rule(rule, profile_id=pid)
+
+            imported_count += 1
+
+        return imported_count
 
 
 class RuleRepository:
@@ -230,7 +425,7 @@ class RuleRepository:
                 (
                     rule.id,
                     profile_id,
-                    rule.rule_type.value,
+                    rule.rule_type.value if hasattr(rule.rule_type, "value") else str(rule.rule_type),
                     rule.pattern,
                     rule.target_subfolder,
                     rule.priority,
@@ -316,6 +511,51 @@ class BaselineRepository:
             conn.commit()
 
 
+class TombstoneRepository:
+    """Manages persistent tombstones recording file deletions and user retention decisions."""
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def record_tombstone(self, profile_id: str, mapping_id: str, rel_path: str, deleted_side: str, decision: str):
+        with self.db.get_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO tombstones (profile_id, mapping_id, rel_path, deleted_side, decision, deleted_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (profile_id, mapping_id, rel_path, deleted_side, decision, datetime.now())
+            )
+            conn.commit()
+
+    def get_tombstones(self, profile_id: str, mapping_id: Optional[str] = None) -> Dict[str, dict]:
+        with self.db.get_connection() as conn:
+            if mapping_id:
+                rows = conn.execute(
+                    "SELECT * FROM tombstones WHERE profile_id = ? AND mapping_id = ?",
+                    (profile_id, mapping_id)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM tombstones WHERE profile_id = ?",
+                    (profile_id,)
+                ).fetchall()
+            return {r["rel_path"]: dict(r) for r in rows}
+
+    def remove_tombstone(self, profile_id: str, mapping_id: str, rel_path: str):
+        with self.db.get_connection() as conn:
+            conn.execute(
+                "DELETE FROM tombstones WHERE profile_id = ? AND mapping_id = ? AND rel_path = ?",
+                (profile_id, mapping_id, rel_path)
+            )
+            conn.commit()
+
+    def clear_tombstones(self, profile_id: str):
+        with self.db.get_connection() as conn:
+            conn.execute("DELETE FROM tombstones WHERE profile_id = ?", (profile_id,))
+            conn.commit()
+
+
 class HistoryRepository:
     """Maintains audit history of sync runs and individual file operations."""
 
@@ -350,3 +590,58 @@ class HistoryRepository:
                 """, (limit,)
             ).fetchall()
             return [dict(r) for r in rows]
+
+
+class PlanRepository:
+    """Persists analysis dry-run plans so they survive application restart."""
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def save_plan(self, profile_id: str, operations: List[PlannedOperation]):
+        with self.db.get_connection() as conn:
+            conn.execute("DELETE FROM cached_plans WHERE profile_id = ?", (profile_id,))
+            rows = [
+                (
+                    profile_id, op.id, op.mapping_id, op.action.value, op.rel_path,
+                    op.source_abs, op.dest_abs, op.size_bytes, op.reason
+                )
+                for op in operations
+            ]
+            if rows:
+                conn.executemany(
+                    """
+                    INSERT INTO cached_plans (
+                        profile_id, op_id, mapping_id, action, rel_path,
+                        source_abs, dest_abs, size_bytes, reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rows
+                )
+            conn.commit()
+
+    def get_plan(self, profile_id: str) -> List[PlannedOperation]:
+        with self.db.get_connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM cached_plans WHERE profile_id = ? ORDER BY op_id ASC",
+                (profile_id,)
+            ).fetchall()
+            plan = []
+            for r in rows:
+                plan.append(PlannedOperation(
+                    id=r["op_id"],
+                    profile_id=r["profile_id"],
+                    mapping_id=r["mapping_id"],
+                    action=PlanAction(r["action"]),
+                    rel_path=r["rel_path"],
+                    source_abs=r["source_abs"],
+                    dest_abs=r["dest_abs"],
+                    size_bytes=r["size_bytes"],
+                    reason=r["reason"] or ""
+                ))
+            return plan
+
+    def clear_plan(self, profile_id: str):
+        with self.db.get_connection() as conn:
+            conn.execute("DELETE FROM cached_plans WHERE profile_id = ?", (profile_id,))
+            conn.commit()

@@ -10,9 +10,10 @@ class PathValidator:
     @staticmethod
     def normalize_rel_path(p: str) -> str:
         """Normalizes relative path using standard forward slashes, stripping leading/trailing slashes."""
-        parts = Path(p).parts
-        # Strip drive or root markers if mistakenly passed
-        safe_parts = [part for part in parts if part not in ("/", "\\", ".") and not part.endswith(":")]
+        # Clean forward/backward slashes first
+        clean = p.replace("\\", "/").strip("/")
+        parts = [part for part in clean.split("/") if part and part != "."]
+        safe_parts = [part for part in parts if not part.endswith(":") and not part.startswith("//")]
         return "/".join(safe_parts)
 
     @staticmethod
@@ -43,16 +44,16 @@ class PathValidator:
         for src in resolved_sources:
             for dst in resolved_dests:
                 if src == dst:
-                    errors.append(f"Source and destination cannot be identical: {src}")
+                    errors.append(f"Джерело та призначення не можуть збігатися (Source and destination cannot be identical): {src}")
                 try:
                     dst.relative_to(src)
-                    errors.append(f"Destination '{dst}' is inside source '{src}', risking infinite recursive loop.")
+                    errors.append(f"Папка призначення '{dst}' знаходиться всередині джерела '{src}' (Destination is inside source, risking infinite recursive loop).")
                 except ValueError:
                     pass
 
                 try:
                     src.relative_to(dst)
-                    errors.append(f"Source '{src}' is inside destination '{dst}', risking nested sync conflicts.")
+                    errors.append(f"Папка-джерело '{src}' знаходиться всередині призначення '{dst}' (Source is inside destination, risking nested sync conflicts).")
                 except ValueError:
                     pass
 

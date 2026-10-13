@@ -21,15 +21,34 @@ class DeviceRole(str, Enum):
     OTHER = "other"
 
 
+class AnalysisMode(str, Enum):
+    """File comparison and analysis strategy during preview/planning."""
+    FAST = "fast"          # Metadata-first: size + mtime (0 disk reads for unchanged files)
+    BALANCED = "balanced"  # Metadata + SQLite Baseline cache + selective sample check
+    FULL = "full"          # Full streaming BLAKE3 checksum comparison of all files
+
+
 class PlanAction(str, Enum):
     """Deterministic actions generated during planning."""
     COPY = "copy"              # Copy new file to destination
     UPDATE = "update"          # Replace/update existing destination file
     SKIP = "skip"              # Nothing to do (identical content/metadata)
-    PRESERVE = "preserve"      # Unilateral deletion or untouched file protected from deletion
+    PRESERVE = "preserve"      # Unilateral deletion or untouched file protected from deletion (Leave on SSD)
     CONFLICT = "conflict"      # Independent changes on both sides requiring resolution
-    RESTORE = "restore"        # Manual or planned restore of an archived version
+    RESTORE = "restore"        # Restore file from SSD back to PC
+    ARCHIVE = "archive"        # Archive copy on SSD and remove active instance
+    DELETE_DEST = "delete_dest"# Synchronously delete from SSD after explicit user confirmation
+    IGNORE = "ignore"          # Ignore file and create exclusion rule
     ERROR = "error"            # Path boundary violation, loop, missing permissions, etc.
+
+
+class DeletionPolicy(str, Enum):
+    """Profile-specific policy for handling deleted files."""
+    PRESERVE_ALL = "preserve_all"          # Зберігати на іншій стороні, нічого не робити
+    ASK_USER = "ask_user"                  # Запитувати рішення для кожного видалення
+    ARCHIVE_COPY = "archive_copy"          # Автоматично створювати архівну копію
+    RESTORE_DELETED = "restore_deleted"    # Відновлювати видалені файли з іншої сторони
+    SYNC_DELETE = "sync_delete"            # Пропонувати синхронне видалення з підтвердженням
 
 
 class ConflictResolution(str, Enum):
@@ -110,10 +129,17 @@ class SyncProfile:
     preserve_versions: bool = True
     max_versions: int = 10
     version_subfolder: str = ".syncforge_versions"
-    verify_hashes: bool = True             # Always verify BLAKE3 hash on copy
+    verify_hashes: bool = True             # Verify BLAKE3 hash after file copy / transfer
+    analysis_mode: AnalysisMode = AnalysisMode.BALANCED  # Fast, Balanced, or Full preview analysis
+    io_yield_delay_ms: float = 0.0         # Pause in ms between file reads/chunks to prevent SSD overheating
+    io_speed_limit_mb: float = 0.0         # Read speed limit in MB/s (0 = unlimited)
+    io_buffer_size_kb: int = 128           # Read buffer size in KB (64, 128, 256, 512, 1024)
+    mtime_tolerance_sec: float = 2.0       # Timestamp difference tolerance (FAT/exFAT = 2.0s, NTFS = 0.001s)
+    balanced_sample_size_kb: int = 64      # Head/tail sample size in KB for balanced mode checks
     enabled: bool = True
     auto_sync_on_connect: bool = False
     auto_sync_interval_mins: int = 0       # 0 = disabled
+    deletion_policy: DeletionPolicy = DeletionPolicy.PRESERVE_ALL
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
 

@@ -24,13 +24,25 @@ class WindowsVolumeScanner:
             return ["C:\\"]
 
         import win32api
-        drives_bitmask = win32api.GetLogicalDrives()
-        drives = []
-        for letter_idx in range(26):
-            if drives_bitmask & (1 << letter_idx):
-                drive_letter = f"{chr(65 + letter_idx)}:\\"
-                drives.append(drive_letter)
-        return drives
+        import ctypes
+
+        # SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX to prevent modal dialogs or device hangs
+        old_err_mode = ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x8000)
+
+        try:
+            drives_bitmask = win32api.GetLogicalDrives()
+            drives = []
+            for letter_idx in range(26):
+                if drives_bitmask & (1 << letter_idx):
+                    drive_letter = f"{chr(65 + letter_idx)}:\\"
+                    dtype = ctypes.windll.kernel32.GetDriveTypeW(drive_letter)
+                    # 0=UNKNOWN, 1=NO_ROOT_DIR, 5=CDROM
+                    if dtype in (0, 1, 5):
+                        continue
+                    drives.append(drive_letter)
+            return drives
+        finally:
+            ctypes.windll.kernel32.SetErrorMode(old_err_mode)
 
     @staticmethod
     def get_volume_info(drive_path: str) -> Tuple[Optional[str], Optional[str], Optional[str], int, int]:
@@ -134,12 +146,12 @@ class DeviceService:
             guid = self.scanner.get_volume_guid_path(drive)
 
             marker_uuid = None
-            marker_path = Path(drive) / MARKER_FILE_NAME
-            if marker_path.exists():
-                try:
+            try:
+                marker_path = Path(drive) / MARKER_FILE_NAME
+                if marker_path.is_file():
                     marker_uuid = marker_path.read_text(encoding="utf-8").strip()
-                except Exception as e:
-                    logger.debug("Failed to read marker file", drive=drive, error=str(e))
+            except Exception as e:
+                logger.debug("Failed to read or check marker file", drive=drive, error=str(e))
 
             friendly = vol_name if vol_name else f"Local Disk ({drive[0]})"
 

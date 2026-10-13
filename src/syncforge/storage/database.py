@@ -8,7 +8,7 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 CREATE_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS schema_info (
@@ -41,12 +41,29 @@ CREATE TABLE IF NOT EXISTS profiles (
     max_versions INTEGER DEFAULT 10,
     version_subfolder TEXT DEFAULT '.syncforge_versions',
     verify_hashes INTEGER DEFAULT 1,
+    analysis_mode TEXT DEFAULT 'balanced',
+    io_yield_delay_ms REAL DEFAULT 0.0,
+    io_speed_limit_mb REAL DEFAULT 0.0,
+    io_buffer_size_kb INTEGER DEFAULT 128,
+    mtime_tolerance_sec REAL DEFAULT 2.0,
+    balanced_sample_size_kb INTEGER DEFAULT 64,
     enabled INTEGER DEFAULT 1,
     auto_sync_on_connect INTEGER DEFAULT 0,
     auto_sync_interval_mins INTEGER DEFAULT 0,
+    deletion_policy TEXT DEFAULT 'preserve_all',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(target_device_id) REFERENCES devices(device_id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS tombstones (
+    profile_id TEXT NOT NULL,
+    mapping_id TEXT NOT NULL,
+    rel_path TEXT NOT NULL,
+    deleted_side TEXT NOT NULL, /* 'source' or 'dest' */
+    decision TEXT NOT NULL,     /* 'keep_dest', 'archive', 'deleted_both', 'ignore' */
+    deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (profile_id, mapping_id, rel_path)
 );
 
 CREATE TABLE IF NOT EXISTS folder_mappings (
@@ -134,6 +151,20 @@ CREATE TABLE IF NOT EXISTS app_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS cached_plans (
+    profile_id TEXT NOT NULL,
+    op_id TEXT NOT NULL,
+    mapping_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    rel_path TEXT NOT NULL,
+    source_abs TEXT,
+    dest_abs TEXT,
+    size_bytes INTEGER DEFAULT 0,
+    reason TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (profile_id, op_id)
+);
 """
 
 
@@ -151,8 +182,8 @@ def get_default_db_path() -> Path:
 class Database:
     """Thread-safe SQLite connection and transaction manager."""
 
-    def __init__(self, db_path: Optional[Path] = None):
-        self.db_path = db_path or get_default_db_path()
+    def __init__(self, db_path: Optional[Path | str] = None):
+        self.db_path = Path(db_path) if db_path else get_default_db_path()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
@@ -172,6 +203,26 @@ class Database:
         """Initializes tables and runs migrations."""
         with self.get_connection() as conn:
             conn.executescript(CREATE_TABLES_SQL)
+            # Run schema migrations for existing databases
+            try:
+                cols = [c["name"] for c in conn.execute("PRAGMA table_info(profiles)").fetchall()]
+                if "deletion_policy" not in cols:
+                    conn.execute("ALTER TABLE profiles ADD COLUMN deletion_policy TEXT DEFAULT 'preserve_all';")
+                if "analysis_mode" not in cols:
+                    conn.execute("ALTER TABLE profiles ADD COLUMN analysis_mode TEXT DEFAULT 'balanced';")
+                if "io_yield_delay_ms" not in cols:
+                    conn.execute("ALTER TABLE profiles ADD COLUMN io_yield_delay_ms REAL DEFAULT 0.0;")
+                if "io_speed_limit_mb" not in cols:
+                    conn.execute("ALTER TABLE profiles ADD COLUMN io_speed_limit_mb REAL DEFAULT 0.0;")
+                if "io_buffer_size_kb" not in cols:
+                    conn.execute("ALTER TABLE profiles ADD COLUMN io_buffer_size_kb INTEGER DEFAULT 128;")
+                if "mtime_tolerance_sec" not in cols:
+                    conn.execute("ALTER TABLE profiles ADD COLUMN mtime_tolerance_sec REAL DEFAULT 2.0;")
+                if "balanced_sample_size_kb" not in cols:
+                    conn.execute("ALTER TABLE profiles ADD COLUMN balanced_sample_size_kb INTEGER DEFAULT 64;")
+            except Exception as e:
+                logger.warning("Migration note", error=str(e))
+
             cur = conn.execute("SELECT version FROM schema_info WHERE version = ?", (SCHEMA_VERSION,))
             if not cur.fetchone():
                 conn.execute("INSERT OR REPLACE INTO schema_info (version) VALUES (?)", (SCHEMA_VERSION,))

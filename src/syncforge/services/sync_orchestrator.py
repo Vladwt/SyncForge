@@ -10,7 +10,7 @@ from syncforge.core.models import (
 from syncforge.core.planner import SyncPlanner
 from syncforge.core.transfer_engine import TransferEngine, TransferProgress
 from syncforge.devices.device_service import DeviceService
-from syncforge.storage.repositories import BaselineRepository, HistoryRepository, DeviceRepository
+from syncforge.storage.repositories import BaselineRepository, HistoryRepository, DeviceRepository, TombstoneRepository, RuleRepository
 
 logger = structlog.get_logger(__name__)
 
@@ -24,6 +24,8 @@ class SyncOrchestrator:
         device_repo: DeviceRepository,
         baseline_repo: BaselineRepository,
         history_repo: HistoryRepository,
+        tombstone_repo: Optional[TombstoneRepository] = None,
+        rule_repo: Optional[RuleRepository] = None,
         planner: Optional[SyncPlanner] = None,
         engine: Optional[TransferEngine] = None
     ):
@@ -31,16 +33,49 @@ class SyncOrchestrator:
         self.device_repo = device_repo
         self.baseline_repo = baseline_repo
         self.history_repo = history_repo
-        self.planner = planner or SyncPlanner(baseline_repo=baseline_repo)
-        self.engine = engine or TransferEngine(baseline_repo=baseline_repo, history_repo=history_repo)
+        self.tombstone_repo = tombstone_repo
+        self.rule_repo = rule_repo
+        self.planner = planner or SyncPlanner(baseline_repo=baseline_repo, tombstone_repo=tombstone_repo)
+        self.engine = engine or TransferEngine(
+            baseline_repo=baseline_repo,
+            history_repo=history_repo,
+            tombstone_repo=tombstone_repo,
+            rule_repo=rule_repo
+        )
 
-    def prepare_dry_run(self, profile: SyncProfile, rule_engine: Optional[object] = None) -> List[PlannedOperation]:
+    def cancel(self):
+        """Cancels active transfer execution."""
+        self.engine.cancel()
+
+    def pause(self):
+        """Pauses active transfer execution."""
+        self.engine.pause()
+
+    def resume(self):
+        """Resumes paused transfer execution."""
+        self.engine.resume()
+
+    def is_paused(self) -> bool:
+        """Checks if transfer is currently paused."""
+        return getattr(self.engine, "_is_paused", False)
+
+    def prepare_dry_run(
+        self,
+        profile: SyncProfile,
+        rule_engine: Optional[object] = None,
+        progress_callback: Optional[Callable[[int, str], None]] = None
+    ) -> List[PlannedOperation]:
         """
         Generates a dry-run plan.
         Enforces strict safety check: verifies target device before generating plan.
         """
         active_dest_root = self._resolve_and_verify_dest_root(profile)
-        return self.planner.generate_plan(profile, active_dest_root, rule_engine=rule_engine)
+        return self.planner.generate_plan(
+            profile,
+            active_dest_root,
+            rule_engine=rule_engine,
+            progress_callback=progress_callback
+        )
 
     def execute_sync(
         self,
@@ -75,6 +110,21 @@ class SyncOrchestrator:
             errs = sum(1 for op in operations if op.status == ExecutionStatus.FAILED)
             confls = sum(1 for op in operations if op.status == ExecutionStatus.CONFLICT)
 
+            # Build informative audit notes
+            abort_reason = getattr(self.engine, "last_abort_reason", None)
+            if abort_reason:
+                notes = f"Перервано: {abort_reason}"
+            elif status == ExecutionStatus.FAILED:
+                first_err = next((op.error_message for op in operations if op.status == ExecutionStatus.FAILED and op.error_message), None)
+                err_detail = f" ({first_err})" if first_err else ""
+                notes = f"Частково: {files_proc} успішно, {errs} помилок{err_detail}"
+            elif status == ExecutionStatus.CANCELLED:
+                notes = f"Скасовано користувачем (успішно: {files_proc})"
+            elif confls > 0:
+                notes = f"Завершено: {files_proc} скопійовано, {confls} конфліктів"
+            else:
+                notes = "Успішно виконано"
+
             self.history_repo.record_job(
                 job_id=job_id,
                 profile_id=profile.id,
@@ -85,7 +135,8 @@ class SyncOrchestrator:
                 files_processed=files_proc,
                 bytes_transferred=bytes_trans,
                 errors_count=errs,
-                conflicts_count=confls
+                conflicts_count=confls,
+                notes=notes
             )
             return status
 

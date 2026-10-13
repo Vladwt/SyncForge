@@ -6,11 +6,12 @@ from typing import Optional, List
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-    QComboBox, QSpinBox, QCheckBox, QPushButton, QTableWidget,
+    QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox, QPushButton, QTableWidget,
     QTableWidgetItem, QHeaderView, QFileDialog, QMessageBox,
     QGroupBox, QFormLayout
 )
-from syncforge.core.models import SyncProfile, FolderMapping, SyncMode, DeviceInfo
+from syncforge.core.models import SyncProfile, FolderMapping, SyncMode, DeviceInfo, DeletionPolicy, AnalysisMode
+from syncforge.core.path_validator import PathValidator
 from syncforge.rules.rule_engine import Rule, RuleType
 from syncforge.i18n.translations import tr
 
@@ -25,25 +26,23 @@ class ProfileEditorDialog(QDialog):
         self.result_profile: Optional[SyncProfile] = None
 
         self.setWindowTitle(tr("profile_editor_title"))
-        self.resize(720, 580)
+        self.resize(720, 620)
         self._init_ui()
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
         layout.setSpacing(14)
 
-        # Form info
-        form_group = QGroupBox(tr("profile_editor_title"))
-        form_layout = QFormLayout(form_group)
+        # 1. Basic Profile Info Group
+        basic_group = QGroupBox(tr("profile_basic_settings"))
+        basic_layout = QFormLayout(basic_group)
 
-        # 1. Profile Name
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("Наприклад: Робочі проекти на SSD")
         if self.profile:
             self.name_edit.setText(self.profile.name)
-        form_layout.addRow(tr("profile_name") + ":", self.name_edit)
+        basic_layout.addRow(tr("profile_name") + ":", self.name_edit)
 
-        # 2. Sync Mode Dropdown with Friendly Descriptions
         self.mode_combo = QComboBox()
         self.mode_combo.addItem(tr("mode_one_way"), SyncMode.ONE_WAY_SAFE)
         self.mode_combo.addItem(tr("mode_bidirectional"), SyncMode.BIDIRECTIONAL)
@@ -52,36 +51,29 @@ class ProfileEditorDialog(QDialog):
             idx = self.mode_combo.findData(self.profile.mode)
             if idx >= 0:
                 self.mode_combo.setCurrentIndex(idx)
-        form_layout.addRow(tr("sync_mode") + ":", self.mode_combo)
+        basic_layout.addRow(tr("sync_mode") + ":", self.mode_combo)
 
-        # 3. Target Device Selection (Dropdown + Local folder fallback)
-        self.device_combo = QComboBox()
-        self.device_combo.addItem("— Вибрати локальну папку замість пристрою —", None)
-        for d in self.devices:
-            mount_txt = f"[{d.current_mount}] " if d.current_mount else ""
-            self.device_combo.addItem(f"{mount_txt}{d.friendly_name} ({d.filesystem or 'Диск'})", d.device_id)
+        self.deletion_policy_combo = QComboBox()
+        self.deletion_policy_combo.addItem(tr("policy_preserve_all"), DeletionPolicy.PRESERVE_ALL)
+        self.deletion_policy_combo.addItem(tr("policy_ask_user"), DeletionPolicy.ASK_USER)
+        self.deletion_policy_combo.addItem(tr("policy_archive_copy"), DeletionPolicy.ARCHIVE_COPY)
+        self.deletion_policy_combo.addItem(tr("policy_restore_deleted"), DeletionPolicy.RESTORE_DELETED)
+        self.deletion_policy_combo.addItem(tr("policy_sync_delete"), DeletionPolicy.SYNC_DELETE)
 
-        if self.profile and self.profile.target_device_id:
-            idx = self.device_combo.findData(self.profile.target_device_id)
-            if idx >= 0:
-                self.device_combo.setCurrentIndex(idx)
-        form_layout.addRow(tr("dest_device") + ":", self.device_combo)
+        cur_policy = getattr(self.profile, "deletion_policy", DeletionPolicy.PRESERVE_ALL) if self.profile else DeletionPolicy.PRESERVE_ALL
+        if isinstance(cur_policy, str):
+            try:
+                cur_policy = DeletionPolicy(cur_policy)
+            except Exception:
+                cur_policy = DeletionPolicy.PRESERVE_ALL
+        p_idx = self.deletion_policy_combo.findData(cur_policy)
+        if p_idx >= 0:
+            self.deletion_policy_combo.setCurrentIndex(p_idx)
+        basic_layout.addRow(tr("deletion_policy") + ":", self.deletion_policy_combo)
 
-        # Fallback local destination path with Browse button
-        dest_box = QHBoxLayout()
-        self.dest_edit = QLineEdit()
-        self.dest_edit.setPlaceholderText("Шлях до папки призначення, напр. E:\\Backup")
-        if self.profile and self.profile.dest_root:
-            self.dest_edit.setText(self.profile.dest_root)
-        browse_dest_btn = QPushButton(tr("browse"))
-        browse_dest_btn.clicked.connect(self._browse_dest)
-        dest_box.addWidget(self.dest_edit)
-        dest_box.addWidget(browse_dest_btn)
-        form_layout.addRow(tr("dest_folder") + ":", dest_box)
+        layout.addWidget(basic_group)
 
-        layout.addWidget(form_group)
-
-        # Folder Mappings Group
+        # 2. Source Folders (Where to copy from on PC)
         mappings_group = QGroupBox(tr("source_folders"))
         mappings_layout = QVBoxLayout(mappings_group)
 
@@ -100,6 +92,7 @@ class ProfileEditorDialog(QDialog):
         self.mappings_table.setHorizontalHeaderLabels([tr("source_path"), tr("dest_subpath")])
         self.mappings_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.mappings_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.mappings_table.setMinimumHeight(130)
         mappings_layout.addWidget(self.mappings_table)
 
         if self.profile:
@@ -108,15 +101,47 @@ class ProfileEditorDialog(QDialog):
 
         layout.addWidget(mappings_group)
 
-        # Advanced Settings & Automation
-        adv_group = QGroupBox("Параметри безпеки та автоматизації")
+        # 3. Target Destination (Where to save: Enrolled Device or Local Folder)
+        dest_group = QGroupBox(tr("dest_section_title"))
+        dest_layout = QFormLayout(dest_group)
+
+        self.device_combo = QComboBox()
+        self.device_combo.addItem(tr("dest_device_none"), None)
+        for d in self.devices:
+            mount_txt = f"[{d.current_mount}] " if d.current_mount else ""
+            self.device_combo.addItem(f"{mount_txt}{d.friendly_name} ({d.filesystem or 'Диск'})", d.device_id)
+
+        if self.profile and self.profile.target_device_id:
+            idx = self.device_combo.findData(self.profile.target_device_id)
+            if idx >= 0:
+                self.device_combo.setCurrentIndex(idx)
+        self.device_combo.currentIndexChanged.connect(self._on_device_changed)
+        dest_layout.addRow(tr("dest_device") + ":", self.device_combo)
+
+        # Fallback local destination path with Browse button
+        dest_box = QHBoxLayout()
+        self.dest_edit = QLineEdit()
+        self.dest_edit.setPlaceholderText("Шлях до папки, напр. D:\\Backup (якщо накопичувач не обрано)")
+        if self.profile and self.profile.dest_root:
+            self.dest_edit.setText(self.profile.dest_root)
+        self.dest_edit.textEdited.connect(self._on_dest_text_edited)
+        browse_dest_btn = QPushButton(tr("browse"))
+        browse_dest_btn.clicked.connect(self._browse_dest)
+        dest_box.addWidget(self.dest_edit)
+        dest_box.addWidget(browse_dest_btn)
+        dest_layout.addRow(tr("dest_folder") + ":", dest_box)
+
+        layout.addWidget(dest_group)
+
+        # 4. Advanced Settings & Automation
+        adv_group = QGroupBox(tr("adv_settings_title"))
         adv_layout = QVBoxLayout(adv_group)
 
         self.preserve_versions_cb = QCheckBox(tr("preserve_versions"))
         self.preserve_versions_cb.setChecked(self.profile.preserve_versions if self.profile else True)
         adv_layout.addWidget(self.preserve_versions_cb)
 
-        self.verify_hashes_cb = QCheckBox(tr("verify_hashes"))
+        self.verify_hashes_cb = QCheckBox(tr("verify_hashes_copy"))
         self.verify_hashes_cb.setChecked(self.profile.verify_hashes if self.profile else True)
         adv_layout.addWidget(self.verify_hashes_cb)
 
@@ -136,6 +161,52 @@ class ProfileEditorDialog(QDialog):
 
         layout.addWidget(adv_group)
 
+        # 5. Analysis Mode & I/O Throttling (External Drive Protection)
+        io_group = QGroupBox(tr("io_settings_title"))
+        io_layout = QFormLayout(io_group)
+        io_layout.setContentsMargins(16, 16, 16, 16)
+        io_layout.setSpacing(10)
+
+        self.analysis_mode_combo = QComboBox()
+        self.analysis_mode_combo.addItem(tr("analysis_fast"), AnalysisMode.FAST)
+        self.analysis_mode_combo.addItem(tr("analysis_balanced"), AnalysisMode.BALANCED)
+        self.analysis_mode_combo.addItem(tr("analysis_full"), AnalysisMode.FULL)
+        cur_mode = getattr(self.profile, "analysis_mode", AnalysisMode.BALANCED) if self.profile else AnalysisMode.BALANCED
+        idx = self.analysis_mode_combo.findData(cur_mode)
+        self.analysis_mode_combo.setCurrentIndex(idx if idx >= 0 else 1)
+        io_layout.addRow(tr("analysis_mode_label"), self.analysis_mode_combo)
+
+        self.io_yield_spin = QDoubleSpinBox()
+        self.io_yield_spin.setRange(0.0, 500.0)
+        self.io_yield_spin.setSingleStep(0.5)
+        self.io_yield_spin.setSuffix(" ms")
+        self.io_yield_spin.setValue(getattr(self.profile, "io_yield_delay_ms", 0.0) if self.profile else 0.0)
+        io_layout.addRow(tr("io_yield_delay"), self.io_yield_spin)
+
+        self.io_speed_spin = QSpinBox()
+        self.io_speed_spin.setRange(0, 2000)
+        self.io_speed_spin.setSingleStep(10)
+        self.io_speed_spin.setSuffix(" MB/s")
+        self.io_speed_spin.setValue(int(getattr(self.profile, "io_speed_limit_mb", 0.0)) if self.profile else 0)
+        io_layout.addRow(tr("io_speed_limit"), self.io_speed_spin)
+
+        self.io_buffer_combo = QComboBox()
+        for b_size in [64, 128, 256, 512, 1024]:
+            self.io_buffer_combo.addItem(f"{b_size} KiB", b_size)
+        cur_buf = getattr(self.profile, "io_buffer_size_kb", 128) if self.profile else 128
+        b_idx = self.io_buffer_combo.findData(cur_buf)
+        self.io_buffer_combo.setCurrentIndex(b_idx if b_idx >= 0 else 1)
+        io_layout.addRow(tr("io_buffer_size"), self.io_buffer_combo)
+
+        self.mtime_tol_spin = QDoubleSpinBox()
+        self.mtime_tol_spin.setRange(0.001, 60.0)
+        self.mtime_tol_spin.setSingleStep(0.5)
+        self.mtime_tol_spin.setSuffix(" s")
+        self.mtime_tol_spin.setValue(getattr(self.profile, "mtime_tolerance_sec", 2.0) if self.profile else 2.0)
+        io_layout.addRow(tr("mtime_tolerance"), self.mtime_tol_spin)
+
+        layout.addWidget(io_group)
+
         # Dialog Buttons
         btn_box = QHBoxLayout()
         btn_box.addStretch()
@@ -147,6 +218,14 @@ class ProfileEditorDialog(QDialog):
         btn_box.addWidget(cancel_btn)
         btn_box.addWidget(save_btn)
         layout.addLayout(btn_box)
+
+    def _on_device_changed(self, index: int):
+        if self.device_combo.currentData():
+            self.dest_edit.clear()
+
+    def _on_dest_text_edited(self, text: str):
+        if text.strip() and self.device_combo.currentIndex() != 0:
+            self.device_combo.setCurrentIndex(0)
 
     def _browse_dest(self):
         d = QFileDialog.getExistingDirectory(self, tr("dest_folder"))
@@ -200,6 +279,32 @@ class ProfileEditorDialog(QDialog):
                 dest_subpath=dst_sub
             ))
 
+        # Validate boundary overlap if local destination is used
+        if dest_root:
+            src_paths = [m.source_root for m in mappings]
+            dst_paths = [str((Path(dest_root) / m.dest_subpath).resolve()) for m in mappings]
+            valid, errs = PathValidator.validate_mappings(src_paths, dst_paths)
+            if not valid:
+                err_text = "\n\n".join(errs)
+                QMessageBox.critical(
+                    self,
+                    "Помилка розташування папок",
+                    f"Виявлено конфлікт шляхів синхронізації:\n\n{err_text}\n\n"
+                    "Папка призначення не повинна знаходитися всередині папки-джерела (і навпаки).\n"
+                    "Будь ласка, вкажіть конкретну робочу папку (наприклад, D:/.../PC_Projects), а не спільну батьківську папку."
+                )
+                return
+
+        del_pol = self.deletion_policy_combo.currentData()
+        if isinstance(del_pol, str):
+            del_pol = DeletionPolicy(del_pol)
+        elif not isinstance(del_pol, DeletionPolicy):
+            del_pol = DeletionPolicy.PRESERVE_ALL
+
+        analysis_mode = self.analysis_mode_combo.currentData()
+        if not isinstance(analysis_mode, AnalysisMode):
+            analysis_mode = AnalysisMode.BALANCED
+
         self.result_profile = SyncProfile(
             id=p_id,
             name=name,
@@ -209,8 +314,14 @@ class ProfileEditorDialog(QDialog):
             mappings=mappings,
             preserve_versions=self.preserve_versions_cb.isChecked(),
             verify_hashes=self.verify_hashes_cb.isChecked(),
+            analysis_mode=analysis_mode,
+            io_yield_delay_ms=float(self.io_yield_spin.value()),
+            io_speed_limit_mb=float(self.io_speed_spin.value()),
+            io_buffer_size_kb=int(self.io_buffer_combo.currentData() or 128),
+            mtime_tolerance_sec=float(self.mtime_tol_spin.value()),
             auto_sync_on_connect=self.auto_connect_cb.isChecked(),
-            auto_sync_interval_mins=self.interval_spin.value()
+            auto_sync_interval_mins=self.interval_spin.value(),
+            deletion_policy=del_pol
         )
         self.accept()
 

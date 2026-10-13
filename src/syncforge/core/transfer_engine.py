@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Callable, List
+import uuid
 import structlog
 from syncforge.core.models import (
     PlannedOperation, PlanAction, ExecutionStatus, ConflictResolution, SyncProfile, SyncMode
@@ -13,7 +14,8 @@ from syncforge.core.models import (
 from syncforge.core.hasher import compute_blake3_hash
 from syncforge.core.path_validator import PathValidator
 from syncforge.core.version_manager import VersionManager
-from syncforge.storage.repositories import BaselineRepository, HistoryRepository
+from syncforge.storage.repositories import BaselineRepository, HistoryRepository, TombstoneRepository, RuleRepository
+from syncforge.rules.rule_engine import Rule, RuleType
 
 logger = structlog.get_logger(__name__)
 
@@ -40,18 +42,23 @@ class TransferEngine:
     - Optional versioning of old file
     - Atomic rename / replace
     - Never delete good destination before replacement is validated
-    - Update baseline on success
+    - Update baseline and tombstones on success
     """
 
     def __init__(
         self,
         baseline_repo: Optional[BaselineRepository] = None,
-        history_repo: Optional[HistoryRepository] = None
+        history_repo: Optional[HistoryRepository] = None,
+        tombstone_repo: Optional[TombstoneRepository] = None,
+        rule_repo: Optional[RuleRepository] = None
     ):
         self.baseline_repo = baseline_repo
         self.history_repo = history_repo
+        self.tombstone_repo = tombstone_repo
+        self.rule_repo = rule_repo
         self._is_cancelled = False
         self._is_paused = False
+        self.last_abort_reason: Optional[str] = None
 
     def cancel(self):
         self._is_cancelled = True
@@ -70,6 +77,8 @@ class TransferEngine:
         progress_callback: Optional[Callable[[TransferProgress], None]] = None
     ) -> ExecutionStatus:
         self._is_paused = False
+        self.last_abort_reason = None
+        self._consecutive_errors = 0
 
         total_bytes = sum(op.size_bytes for op in operations if op.action in (PlanAction.COPY, PlanAction.UPDATE))
         progress = TransferProgress(
@@ -92,9 +101,15 @@ class TransferEngine:
         last_time = start_time
         last_bytes = 0
 
+        # Buffer size and throttling config
+        buf_size = max(4096, getattr(profile, "io_buffer_size_kb", 128) * 1024)
+        yield_delay_s = max(0.0, getattr(profile, "io_yield_delay_ms", 0.0) / 1000.0)
+        speed_limit_mb = max(0.0, getattr(profile, "io_speed_limit_mb", 0.0))
+        speed_limit_bps = speed_limit_mb * 1024 * 1024 if speed_limit_mb > 0 else 0.0
+
         for op in operations:
             if self._is_cancelled:
-                progress.status_text = "Operation cancelled by user."
+                progress.status_text = "Синхронізацію скасовано користувачем."
                 if progress_callback:
                     progress_callback(progress)
                 return ExecutionStatus.CANCELLED
@@ -117,26 +132,105 @@ class TransferEngine:
 
             # Process operation
             try:
-                if op.action == PlanAction.SKIP or op.action == PlanAction.PRESERVE:
+                if op.action == PlanAction.SKIP:
                     op.status = ExecutionStatus.SKIPPED
+
+                elif op.action == PlanAction.PRESERVE:
+                    # User confirmed keeping file on SSD or PC
+                    if not op.source_abs and op.dest_abs:
+                        if self.tombstone_repo:
+                            self.tombstone_repo.record_tombstone(
+                                profile.id, op.mapping_id, op.rel_path, "source", "keep_dest"
+                            )
+                        if self.baseline_repo:
+                            self.baseline_repo.remove_baseline_entry(profile.id, op.mapping_id, op.rel_path)
+                    elif op.source_abs and not op.dest_abs:
+                        if self.tombstone_repo:
+                            self.tombstone_repo.record_tombstone(
+                                profile.id, op.mapping_id, op.rel_path, "dest", "keep_src"
+                            )
+                        if self.baseline_repo:
+                            self.baseline_repo.remove_baseline_entry(profile.id, op.mapping_id, op.rel_path)
+                    op.status = ExecutionStatus.SUCCESS
+
+                elif op.action == PlanAction.RESTORE:
+                    self._execute_restore(profile, op, version_mgr)
+                    bytes_transferred += op.size_bytes
+                    progress.transferred_bytes = bytes_transferred
+
+                elif op.action == PlanAction.ARCHIVE:
+                    self._execute_archive(profile, op)
+
+                elif op.action == PlanAction.DELETE_DEST:
+                    self._execute_delete_dest(profile, op)
+
+                elif op.action == PlanAction.IGNORE:
+                    self._execute_ignore(profile, op)
+
                 elif op.action == PlanAction.ERROR:
                     op.status = ExecutionStatus.FAILED
                     errors_count += 1
+
                 elif op.action == PlanAction.CONFLICT:
                     if op.conflict_resolution is not None:
                         self._resolve_and_execute_conflict(profile, op, version_mgr)
                     else:
                         op.status = ExecutionStatus.CONFLICT
                         conflicts_count += 1
-                elif op.action in (PlanAction.COPY, PlanAction.UPDATE, PlanAction.RESTORE):
-                    self._execute_copy_or_update(profile, op, version_mgr)
+
+                elif op.action in (PlanAction.COPY, PlanAction.UPDATE):
+                    self._execute_copy_or_update(
+                        profile, op, version_mgr,
+                        buf_size=buf_size,
+                        yield_delay_s=yield_delay_s,
+                        speed_limit_bps=speed_limit_bps
+                    )
                     bytes_transferred += op.size_bytes
                     progress.transferred_bytes = bytes_transferred
+
             except Exception as e:
                 logger.error("Error executing operation", op=op.rel_path, error=str(e))
                 op.status = ExecutionStatus.FAILED
                 op.error_message = str(e)
                 errors_count += 1
+
+                # Detect hardware / device disconnection or I/O failure
+                is_device_disconnected = False
+                winerr = getattr(e, "winerror", None)
+                errno_val = getattr(e, "errno", None)
+
+                # Check for known Windows I/O error codes (1117, 1167, 15, 21, 433) or Errno 22 (EINVAL) during drive reset
+                if winerr in (1117, 1167, 15, 21, 433):
+                    is_device_disconnected = True
+                else:
+                    # Check if destination root is still accessible
+                    try:
+                        dst_root_check = Path(op.dest_abs).anchor if op.dest_abs else (profile.dest_root or "")
+                        if dst_root_check and not Path(dst_root_check).exists():
+                            is_device_disconnected = True
+                    except Exception:
+                        is_device_disconnected = True
+
+                # Also abort if multiple consecutive write failures occur (drive unresponsive)
+                if not hasattr(self, "_consecutive_errors"):
+                    self._consecutive_errors = 0
+                self._consecutive_errors += 1
+
+                if is_device_disconnected or self._consecutive_errors >= 5:
+                    reason_msg = f"Накопичувач відключено або апаратний збій I/O ({e})" if is_device_disconnected else f"Серія з {self._consecutive_errors} критичних помилок I/O поспіль ({e})"
+                    logger.critical("Target drive disconnected or unresponsive! Aborting remaining operations.", error=str(e))
+                    progress.status_text = f"Помилка вводу/виводу: накопичувач відключено або збій ({e})"
+                    self.last_abort_reason = reason_msg
+                    progress.completed_operations += 1
+                    if progress_callback:
+                        progress_callback(progress)
+                    return ExecutionStatus.FAILED
+            else:
+                self._consecutive_errors = 0
+
+            # Inter-file yield delay if configured
+            if yield_delay_s > 0:
+                time.sleep(yield_delay_s)
 
             progress.completed_operations += 1
             if progress_callback:
@@ -146,7 +240,13 @@ class TransferEngine:
         return status
 
     def _execute_copy_or_update(
-        self, profile: SyncProfile, op: PlannedOperation, version_mgr: Optional[VersionManager]
+        self,
+        profile: SyncProfile,
+        op: PlannedOperation,
+        version_mgr: Optional[VersionManager],
+        buf_size: int = COPY_BUFFER_SIZE,
+        yield_delay_s: float = 0.0,
+        speed_limit_bps: float = 0.0
     ):
         if not op.source_abs or not op.dest_abs:
             raise ValueError(f"Missing source or destination path for {op.rel_path}")
@@ -169,24 +269,51 @@ class TransferEngine:
 
         dst_path.parent.mkdir(parents=True, exist_ok=True)
 
-
         # Copy to temporary file first: <dest_file>.<uuid>.tmp
         tmp_dst = dst_path.parent / f"{dst_path.name}.{time.time_ns()}.tmp"
 
         try:
-            # Stream copying
+            # Stream copying with throttling
             with open(src_path, "rb") as fsrc, open(tmp_dst, "wb") as fdst:
+                chunk_start = time.perf_counter()
                 while True:
                     if self._is_cancelled:
                         tmp_dst.unlink(missing_ok=True)
                         raise InterruptedError("Cancelled during transfer")
-                    chunk = fsrc.read(COPY_BUFFER_SIZE)
+                    while self._is_paused:
+                        time.sleep(0.1)
+                        if self._is_cancelled:
+                            tmp_dst.unlink(missing_ok=True)
+                            raise InterruptedError("Cancelled during transfer")
+                    chunk = fsrc.read(buf_size)
                     if not chunk:
                         break
                     fdst.write(chunk)
 
+                    # Speed limit throttle
+                    if speed_limit_bps > 0:
+                        elapsed = time.perf_counter() - chunk_start
+                        expected_time = len(chunk) / speed_limit_bps
+                        if expected_time > elapsed:
+                            time.sleep(expected_time - elapsed)
+                        chunk_start = time.perf_counter()
+
+                    # Yield delay per chunk if specified
+                    if yield_delay_s > 0:
+                        time.sleep(yield_delay_s)
+
+                # Ensure written bytes are flushed to disk
+                fdst.flush()
+                try:
+                    os.fsync(fdst.fileno())
+                except OSError:
+                    pass
+
             # Preserve metadata (timestamps, attributes)
-            shutil.copystat(str(src_path), str(tmp_dst))
+            try:
+                shutil.copystat(str(src_path), str(tmp_dst))
+            except Exception as stat_err:
+                logger.warning("copystat non-fatal error", path=op.rel_path, error=str(stat_err))
 
             # Verification before replacement: check file sizes
             tmp_stat = tmp_dst.stat()
@@ -211,8 +338,12 @@ class TransferEngine:
 
             op.status = ExecutionStatus.SUCCESS
 
-            # Update baseline in Mode B
-            if profile.mode == SyncMode.BIDIRECTIONAL and self.baseline_repo:
+            # Clear persistent tombstone on successful copy/update
+            if self.tombstone_repo:
+                self.tombstone_repo.remove_tombstone(profile.id, op.mapping_id, op.rel_path)
+
+            # Update baseline across all modes so deletion tracking works reliably
+            if self.baseline_repo:
                 dst_st = dst_path.stat()
                 self.baseline_repo.save_baseline_entry(
                     profile_id=profile.id,
@@ -240,6 +371,92 @@ class TransferEngine:
                 except Exception:
                     pass
             raise e
+
+    def _execute_restore(
+        self, profile: SyncProfile, op: PlannedOperation, version_mgr: Optional[VersionManager]
+    ):
+        """Restores a file from destination SSD back to PC source."""
+        if not op.dest_abs or not Path(op.dest_abs).exists():
+            raise FileNotFoundError(f"Файл для відновлення на цільовому пристрої відсутній: {op.dest_abs}")
+
+        mapping = next((m for m in profile.mappings if m.id == op.mapping_id), None)
+        if mapping:
+            src_path = Path(mapping.source_root) / op.rel_path
+        elif op.source_abs:
+            src_path = Path(op.source_abs)
+        else:
+            raise ValueError(f"Неможливо визначити шлях на ПК для відновлення: {op.rel_path}")
+
+        restore_op = PlannedOperation(
+            id=str(uuid.uuid4()),
+            profile_id=profile.id,
+            mapping_id=op.mapping_id,
+            action=PlanAction.COPY,
+            rel_path=op.rel_path,
+            source_abs=op.dest_abs,  # Read from SSD
+            dest_abs=str(src_path),  # Write to PC
+            size_bytes=op.size_bytes
+        )
+        self._execute_copy_or_update(profile, restore_op, version_mgr)
+        if self.tombstone_repo:
+            self.tombstone_repo.remove_tombstone(profile.id, op.mapping_id, op.rel_path)
+        op.status = ExecutionStatus.SUCCESS
+
+    def _execute_archive(self, profile: SyncProfile, op: PlannedOperation):
+        """Moves a file on destination SSD to .syncforge_archive subfolder and records tombstone."""
+        if not op.dest_abs or not Path(op.dest_abs).exists():
+            raise FileNotFoundError(f"Файл для архівування відсутній: {op.dest_abs}")
+
+        src_file = Path(op.dest_abs)
+        dest_root = Path(profile.dest_root) if profile.dest_root else src_file.parent
+        archive_dir = dest_root / ".syncforge_archive"
+
+        rel_p = Path(op.rel_path)
+        ts = int(time.time())
+        archive_target = archive_dir / rel_p.parent / f"{rel_p.stem}.{ts}{rel_p.suffix}"
+        archive_target.parent.mkdir(parents=True, exist_ok=True)
+
+        shutil.move(str(src_file), str(archive_target))
+
+        if self.tombstone_repo:
+            self.tombstone_repo.record_tombstone(
+                profile.id, op.mapping_id, op.rel_path, "source", "archive"
+            )
+        if self.baseline_repo:
+            self.baseline_repo.remove_baseline_entry(profile.id, op.mapping_id, op.rel_path)
+        op.status = ExecutionStatus.SUCCESS
+
+    def _execute_delete_dest(self, profile: SyncProfile, op: PlannedOperation):
+        """Deletes a file on destination SSD after user confirmation and records tombstone."""
+        if op.dest_abs and Path(op.dest_abs).exists():
+            Path(op.dest_abs).unlink(missing_ok=True)
+
+        if self.tombstone_repo:
+            self.tombstone_repo.record_tombstone(
+                profile.id, op.mapping_id, op.rel_path, "both", "deleted_both"
+            )
+        if self.baseline_repo:
+            self.baseline_repo.remove_baseline_entry(profile.id, op.mapping_id, op.rel_path)
+        op.status = ExecutionStatus.SUCCESS
+
+    def _execute_ignore(self, profile: SyncProfile, op: PlannedOperation):
+        """Creates an exclusion rule and records tombstone to ignore this file."""
+        if self.rule_repo:
+            pattern = op.rel_path.replace("\\", "/")
+            rule = Rule(
+                id=str(uuid.uuid4()),
+                rule_type=RuleType.EXCLUDE_GLOB,
+                pattern=pattern,
+                priority=100,
+                enabled=True
+            )
+            self.rule_repo.save_rule(rule, profile_id=profile.id)
+
+        if self.tombstone_repo:
+            self.tombstone_repo.record_tombstone(
+                profile.id, op.mapping_id, op.rel_path, "source", "ignore"
+            )
+        op.status = ExecutionStatus.SKIPPED
 
     def _resolve_and_execute_conflict(
         self, profile: SyncProfile, op: PlannedOperation, version_mgr: Optional[VersionManager]

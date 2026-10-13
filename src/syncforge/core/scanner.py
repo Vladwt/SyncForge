@@ -3,7 +3,7 @@
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Callable
 import structlog
 from syncforge.core.models import FileMetadata
 
@@ -16,7 +16,11 @@ class FileScanner:
     def __init__(self, follow_symlinks: bool = False):
         self.follow_symlinks = follow_symlinks
 
-    def scan_directory(self, root_dir: str) -> Dict[str, FileMetadata]:
+    def scan_directory(
+        self,
+        root_dir: str,
+        progress_callback: Optional[Callable[[int, str], None]] = None
+    ) -> Dict[str, FileMetadata]:
         """
         Scans a directory tree safely.
         Returns a mapping: {rel_path: FileMetadata}
@@ -96,6 +100,8 @@ class FileScanner:
                         is_readonly=not os.access(str(file_path), os.W_OK)
                     )
                     results[rel_p] = meta
+                    if progress_callback and (len(results) % 20 == 0):
+                        progress_callback(len(results), rel_p)
                 except PermissionError as pe:
                     rel_p = str(file_path.relative_to(root_path)).replace("\\", "/")
                     results[rel_p] = FileMetadata(
@@ -108,5 +114,8 @@ class FileScanner:
                     )
                 except Exception as ex:
                     logger.warning("Failed to stat file", path=str(file_path), error=str(ex))
+
+        if progress_callback:
+            progress_callback(len(results), "")
 
         return results
