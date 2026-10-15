@@ -9,6 +9,7 @@ from syncforge.gui.pages.conflicts_page import ConflictsPage
 from syncforge.gui.pages.history_page import HistoryPage
 from syncforge.gui.pages.settings_page import SettingsPage
 from syncforge.gui.pages.faq_page import FaqPage
+from syncforge.gui.pages.file_manager_page import FileManagerPage
 
 __all__ = [
     "DashboardPage",
@@ -20,4 +21,5 @@ __all__ = [
     "HistoryPage",
     "SettingsPage",
     "FaqPage",
+    "FileManagerPage",
 ]

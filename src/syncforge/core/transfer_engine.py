@@ -131,11 +131,15 @@ class TransferEngine:
         def flush_batches(force: bool = False):
             nonlocal last_flush_time
             now_f = time.time()
-            if force or len(pending_baselines) >= 50 or (now_f - last_flush_time >= 2.0 and pending_baselines):
-                if self.baseline_repo and pending_baselines:
-                    self.baseline_repo.save_baseline_batch(pending_baselines)
+            if force or len(pending_baselines) >= 50 or (now_f - last_flush_time >= 2.0 and (pending_baselines or pending_tombstones)):
+                if self.baseline_repo and (pending_baselines or pending_tombstones):
+                    self.baseline_repo.commit_sync_state_batch(
+                        baseline_entries=list(pending_baselines),
+                        tombstone_removals=list(pending_tombstones)
+                    )
                     pending_baselines.clear()
-                if self.tombstone_repo and pending_tombstones:
+                    pending_tombstones.clear()
+                elif self.tombstone_repo and pending_tombstones:
                     self.tombstone_repo.remove_tombstones_batch(pending_tombstones)
                     pending_tombstones.clear()
                 last_flush_time = now_f

@@ -10,6 +10,7 @@ TRANSLATIONS = {
         "preview": "Попередній перегляд",
         "conflicts": "Конфлікти",
         "history": "Історія",
+        "file_manager": "Файловий менеджер",
         "settings": "Налаштування",
         "faq": "Довідка / FAQ",
         
@@ -18,6 +19,16 @@ TRANSLATIONS = {
         "status_syncing": "● Синхронізація...",
         "status_error": "● Помилка",
         "status_cancelled": "● Скасовано",
+
+        # File Manager & Tools
+        "duplicate_finder": "Пошук дублікатів",
+        "copy_left_to_right": "Копіювати ➡️",
+        "copy_right_to_left": "⬅️ Копіювати",
+        "compare_folders": "Порівняти папки",
+        "new_folder": "Нова папка",
+        "delete_selected": "Видалити",
+        "refresh_both": "Оновити обидві",
+        "load_profile_paths": "Шляхи з профілю",
 
         # Dashboard cards & actions
         "total_profiles": "Всього профілів",
@@ -128,7 +139,7 @@ TRANSLATIONS = {
         "action": "Дія",
         "size": "Розмір",
         "reason": "Причина / Статус безпеки",
-        "execute_plan": "Виконати план синхронізації",
+        "execute_plan": "Синхронізувати",
         "cancel_execution": "Зупинити",
         "pause_execution": "Пауза",
         "resume_execution": "Продовжити",
@@ -227,6 +238,7 @@ TRANSLATIONS = {
         "preview": "Preview",
         "conflicts": "Conflicts",
         "history": "History",
+        "file_manager": "File Manager",
         "settings": "Settings",
         "faq": "Help & FAQ",
         
@@ -234,6 +246,16 @@ TRANSLATIONS = {
         "status_syncing": "● Synchronizing...",
         "status_error": "● Error",
         "status_cancelled": "● Cancelled",
+
+        # File Manager & Tools
+        "duplicate_finder": "Duplicate Finder",
+        "copy_left_to_right": "Copy ➡️",
+        "copy_right_to_left": "⬅️ Copy",
+        "compare_folders": "Compare Folders",
+        "new_folder": "New Folder",
+        "delete_selected": "Delete",
+        "refresh_both": "Refresh Both",
+        "load_profile_paths": "Profile Paths",
 
         "total_profiles": "Total Profiles",
         "connected_devices": "Connected Devices",
@@ -339,7 +361,7 @@ TRANSLATIONS = {
         "action": "Action",
         "size": "Size",
         "reason": "Reason / Safety Status",
-        "execute_plan": "Execute Sync Plan",
+        "execute_plan": "Synchronize",
         "cancel_execution": "Stop",
         "pause_execution": "Pause",
         "resume_execution": "Resume",

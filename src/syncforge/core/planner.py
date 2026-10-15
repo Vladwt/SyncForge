@@ -81,6 +81,12 @@ class SyncPlanner:
                 progress_callback(100, "Немає активних папок для аналізу")
             return operations
 
+        if self.baseline_repo:
+            try:
+                self.baseline_repo.reconcile_state_after_crash(profile.id)
+            except Exception as e:
+                logger.warning("Baseline crash reconciliation non-fatal error", error=str(e))
+
         num_mappings = len(enabled_mappings)
         slice_weight = 90.0 / num_mappings
 

@@ -117,8 +117,8 @@ class ProfileEditorDialog(QDialog):
         self.mappings_table.setHorizontalHeaderLabels([tr("source_path"), tr("dest_subpath")])
         self.mappings_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.mappings_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.mappings_table.setMinimumHeight(100)
-        self.mappings_table.setMaximumHeight(140)
+        self.mappings_table.setMinimumHeight(190)
+        self.mappings_table.setMaximumHeight(260)
         mappings_layout.addWidget(self.mappings_table)
 
         if self.profile:
@@ -272,6 +272,7 @@ class ProfileEditorDialog(QDialog):
     def _insert_mapping_row(self, src: str, dst_sub: str):
         row = self.mappings_table.rowCount()
         self.mappings_table.insertRow(row)
+        self.mappings_table.setRowHeight(row, 28)
         self.mappings_table.setItem(row, 0, QTableWidgetItem(src))
         self.mappings_table.setItem(row, 1, QTableWidgetItem(dst_sub))
 

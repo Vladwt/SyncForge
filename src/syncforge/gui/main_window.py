@@ -28,11 +28,13 @@ from syncforge.rules.rule_engine import RuleEngine, Rule, RuleType
 from syncforge.i18n.translations import tr, set_language, format_bytes, CURRENT_LANG
 from syncforge.core.planner import _sort_plan_key
 from syncforge.gui.dialogs import ProfileEditorDialog, RuleEditorDialog, show_scrollable_error
+from syncforge.gui.duplicates_dialog import DuplicateFinderDialog
 from syncforge.gui.styles import DARK_STYLESHEET, LIGHT_STYLESHEET, create_app_icon
 from syncforge.gui.workers import PreviewScanWorker, SyncExecutionWorker
 from syncforge.gui.pages import (
     DashboardPage, DevicesPage, ProfilesPage, RulesPage,
-    PreviewPage, ConflictsPage, HistoryPage, SettingsPage, FaqPage
+    PreviewPage, ConflictsPage, HistoryPage, SettingsPage, FaqPage,
+    FileManagerPage
 )
 
 logger = structlog.get_logger(__name__)
@@ -352,6 +354,7 @@ class MainWindow(QMainWindow):
             ("preview", tr("preview")),
             ("conflicts", tr("conflicts")),
             ("history", tr("history")),
+            ("file_manager", tr("file_manager")),
             ("settings", tr("settings")),
             ("faq", tr("faq")),
         ]
@@ -367,7 +370,9 @@ class MainWindow(QMainWindow):
         nav_layout.addStretch()
 
         self.status_lbl = QLabel(tr("status_ready"))
-        self.status_lbl.setStyleSheet("color: #57f287; font-weight: bold; padding: 6px;")
+        self.status_lbl.setWordWrap(True)
+        self.status_lbl.setMaximumHeight(48)
+        self.status_lbl.setStyleSheet("color: #57f287; font-weight: bold; padding: 4px; font-size: 12px;")
         nav_layout.addWidget(self.status_lbl)
 
         main_layout.addWidget(nav_panel)
@@ -383,6 +388,7 @@ class MainWindow(QMainWindow):
             on_create_profile=self._create_new_profile_dialog,
             on_switch_page=self._switch_page,
             get_current_plan_conflicts=lambda: sum(1 for op in self.current_plan if op.action == PlanAction.CONFLICT),
+            on_open_duplicates=self._open_duplicate_finder_dialog,
             parent=self
         )
         self.stack.addWidget(self.dashboard_page)
@@ -439,7 +445,14 @@ class MainWindow(QMainWindow):
         )
         self.stack.addWidget(self.history_page)
 
-        # 8. Settings
+        # 8. File Manager (Total Commander style)
+        self.file_manager_page = FileManagerPage(
+            profile_repo=self.profile_repo,
+            parent=self
+        )
+        self.stack.addWidget(self.file_manager_page)
+
+        # 9. Settings
         self.settings_page = SettingsPage(
             settings_repo=self.settings_repo,
             on_theme_changed=self._on_theme_changed,
@@ -448,11 +461,18 @@ class MainWindow(QMainWindow):
         )
         self.stack.addWidget(self.settings_page)
 
-        # 9. FAQ
+        # 10. FAQ
         self.faq_page = FaqPage(parent=self)
         self.stack.addWidget(self.faq_page)
 
         self._switch_page("dashboard")
+
+    def _open_duplicate_finder_dialog(self, initial_path: Optional[str] = None):
+        target = initial_path
+        if not target and self.active_profile and self.active_profile.mappings:
+            target = self.active_profile.mappings[0].source_root
+        dlg = DuplicateFinderDialog(initial_dir=target, parent=self)
+        dlg.exec()
 
     def _switch_page(self, page_id: str):
         for pid, btn in self.nav_buttons.items():
@@ -460,8 +480,8 @@ class MainWindow(QMainWindow):
 
         index_map = {
             "dashboard": 0, "devices": 1, "profiles": 2, "rules": 3,
-            "preview": 4, "conflicts": 5, "history": 6, "settings": 7,
-            "faq": 8
+            "preview": 4, "conflicts": 5, "history": 6, "file_manager": 7,
+            "settings": 8, "faq": 9
         }
         self.stack.setCurrentIndex(index_map.get(page_id, 0))
 
@@ -490,6 +510,8 @@ class MainWindow(QMainWindow):
             self.conflicts_page.refresh()
         elif page_id == "history":
             self.history_page.refresh()
+        elif page_id == "file_manager":
+            self.file_manager_page.refresh_both()
 
     def _on_theme_changed(self, is_dark: bool):
         self.is_dark_theme = is_dark

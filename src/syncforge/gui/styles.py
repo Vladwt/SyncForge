@@ -84,15 +84,20 @@ QTableCornerButton::section {
     background-color: #2b2d31;
     border: none;
 }
-QLineEdit, QComboBox, QSpinBox {
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QAbstractSpinBox {
     background-color: #1e1f22;
     border: 1px solid #35373c;
     border-radius: 4px;
     padding: 6px;
     color: #f2f3f5;
 }
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus {
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QAbstractSpinBox:focus {
     border: 1px solid #5865f2;
+}
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QAbstractSpinBox:disabled {
+    background-color: #161719;
+    color: #6d737b;
+    border-color: #2b2d31;
 }
 QComboBox QAbstractItemView {
     background-color: #1e1f22;
@@ -202,12 +207,20 @@ QTableCornerButton::section {
     background-color: #e3e5e8;
     border: none;
 }
-QLineEdit, QComboBox, QSpinBox {
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QAbstractSpinBox {
     background-color: #ffffff;
     border: 1px solid #c7ccd1;
     border-radius: 4px;
     padding: 6px;
     color: #2e3338;
+}
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QAbstractSpinBox:focus {
+    border: 1px solid #5865f2;
+}
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QAbstractSpinBox:disabled {
+    background-color: #e3e5e8;
+    color: #878c93;
+    border-color: #d1d4d7;
 }
 QProgressBar {
     background-color: #e3e5e8;

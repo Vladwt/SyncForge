@@ -20,6 +20,7 @@ class DashboardPage(QWidget):
         on_create_profile: Callable[[], None],
         on_switch_page: Callable[[str], None],
         get_current_plan_conflicts: Callable[[], int],
+        on_open_duplicates: Optional[Callable[[], None]] = None,
         parent=None
     ):
         super().__init__(parent)
@@ -28,6 +29,7 @@ class DashboardPage(QWidget):
         self.on_create_profile = on_create_profile
         self.on_switch_page = on_switch_page
         self.get_current_plan_conflicts = get_current_plan_conflicts
+        self.on_open_duplicates = on_open_duplicates
         self._init_ui()
 
     def _init_ui(self):
@@ -63,8 +65,19 @@ class DashboardPage(QWidget):
         quick_preview_btn = QPushButton(tr("preview_plan"))
         quick_preview_btn.clicked.connect(lambda: self.on_switch_page("profiles"))
 
+        quick_mgr_btn = QPushButton("📁 " + tr("file_manager"))
+        quick_mgr_btn.clicked.connect(lambda: self.on_switch_page("file_manager"))
+
+        quick_dup_btn = QPushButton("🔎 " + tr("duplicate_finder"))
+        if self.on_open_duplicates:
+            quick_dup_btn.clicked.connect(self.on_open_duplicates)
+        else:
+            quick_dup_btn.clicked.connect(lambda: self.on_switch_page("file_manager"))
+
         ab_btns.addWidget(quick_prof_btn)
         ab_btns.addWidget(quick_preview_btn)
+        ab_btns.addWidget(quick_mgr_btn)
+        ab_btns.addWidget(quick_dup_btn)
         ab_btns.addStretch()
         ab_layout.addLayout(ab_btns)
         layout.addWidget(action_box)

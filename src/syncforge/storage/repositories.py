@@ -517,6 +517,65 @@ class BaselineRepository:
             )
             conn.commit()
 
+    def commit_sync_state_batch(
+        self,
+        baseline_entries: List[tuple],
+        tombstone_removals: Optional[List[tuple]] = None,
+        tombstone_records: Optional[List[tuple]] = None
+    ):
+        """
+        Atomically commits baselines and tombstone changes in a SINGLE SQLite transaction,
+        guaranteeing crash recovery consistency for Mode B bidirectional synchronization.
+        """
+        if not baseline_entries and not tombstone_removals and not tombstone_records:
+            return
+
+        with self.db.get_connection() as conn:
+            if baseline_entries:
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO baselines (
+                        profile_id, mapping_id, rel_path, side, size_bytes, mtime_ns, hash_blake3, last_synced_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    baseline_entries
+                )
+            if tombstone_removals:
+                conn.executemany(
+                    "DELETE FROM tombstones WHERE profile_id = ? AND mapping_id = ? AND rel_path = ?",
+                    tombstone_removals
+                )
+            if tombstone_records:
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO tombstones (profile_id, mapping_id, rel_path, deleted_side, decision, deleted_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    tombstone_records
+                )
+            conn.commit()
+
+    def reconcile_state_after_crash(self, profile_id: str):
+        """
+        Cleans up inconsistent state if a previous sync crashed or aborted midway:
+        - Prunes obsolete tombstones for files where an active baseline exists.
+        """
+        with self.db.get_connection() as conn:
+            conn.execute(
+                """
+                DELETE FROM tombstones
+                WHERE profile_id = ?
+                  AND rel_path IN (
+                      SELECT b.rel_path FROM baselines b
+                      WHERE b.profile_id = tombstones.profile_id
+                        AND b.mapping_id = tombstones.mapping_id
+                        AND b.last_synced_at >= tombstones.deleted_at
+                  )
+                """,
+                (profile_id,)
+            )
+            conn.commit()
+
     def remove_baseline_entry(self, profile_id: str, mapping_id: str, rel_path: str):
         with self.db.get_connection() as conn:
             conn.execute(

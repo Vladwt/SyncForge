@@ -123,7 +123,7 @@ def test_gui_v2_features(tmp_path, qtbot):
 
         # 5. Check FAQ Page
         window._switch_page("faq")
-        assert window.stack.currentIndex() == 8
+        assert window.stack.currentWidget() == window.faq_page
 
         # 6. Test 'Оновити аналіз' button discovers new files
         window._switch_page("preview")

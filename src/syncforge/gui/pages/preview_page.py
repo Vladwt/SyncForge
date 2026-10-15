@@ -50,38 +50,53 @@ class PreviewPage(QWidget):
         header.setStyleSheet("font-size: 24px; font-weight: bold;")
         layout.addWidget(header)
 
-        top_ctrl = QHBoxLayout()
-        self.exec_btn = QPushButton(tr("execute_plan"))
+        # Top Row 1: Actions and Profile selection
+        actions_row = QHBoxLayout()
+        actions_row.setSpacing(10)
+
+        self.exec_btn = QPushButton(f"⚡ {tr('execute_plan')}")
         self.exec_btn.setProperty("class", "PrimaryBtn")
+        self.exec_btn.setMinimumWidth(135)
         self.exec_btn.clicked.connect(self.on_execute)
-        top_ctrl.addWidget(self.exec_btn)
+        actions_row.addWidget(self.exec_btn)
 
         # Pause and Stop buttons
         self.pause_btn = QPushButton(f"⏸️ {tr('pause_execution')}")
         self.pause_btn.setEnabled(False)
+        self.pause_btn.setMinimumWidth(85)
         self.pause_btn.clicked.connect(self.on_pause_toggle)
-        top_ctrl.addWidget(self.pause_btn)
+        actions_row.addWidget(self.pause_btn)
 
         self.stop_btn = QPushButton(f"⏹️ {tr('cancel_execution')}")
         self.stop_btn.setProperty("class", "DangerBtn")
         self.stop_btn.setEnabled(False)
+        self.stop_btn.setMinimumWidth(95)
         self.stop_btn.clicked.connect(self.on_cancel)
-        top_ctrl.addWidget(self.stop_btn)
+        actions_row.addWidget(self.stop_btn)
 
         # Profile switcher directly on Preview page
         prof_lbl = QLabel(tr("history_profile") + ":")
-        top_ctrl.addWidget(prof_lbl)
+        actions_row.addWidget(prof_lbl)
         self.profile_combo = QComboBox()
-        self.profile_combo.setMinimumWidth(180)
+        self.profile_combo.setMinimumWidth(160)
         self.profile_combo.currentIndexChanged.connect(self.on_profile_selected)
-        top_ctrl.addWidget(self.profile_combo)
+        actions_row.addWidget(self.profile_combo)
 
         # Re-scan button
         self.rescan_btn = QPushButton("🔄 Оновити аналіз")
+        self.rescan_btn.setMinimumWidth(130)
         self.rescan_btn.clicked.connect(self.on_rescan)
-        top_ctrl.addWidget(self.rescan_btn)
+        actions_row.addWidget(self.rescan_btn)
+
+        actions_row.addStretch()
+        layout.addLayout(actions_row)
+
+        # Top Row 2: Search and Category Filtering
+        filters_row = QHBoxLayout()
+        filters_row.setSpacing(10)
 
         self.action_filter_combo = QComboBox()
+        self.action_filter_combo.setMinimumWidth(150)
         self.action_filter_combo.addItem("⚡ " + tr("filter_pending"), "pending_only")
         self.action_filter_combo.addItem("📋 " + tr("filter_all"), "all")
         self.action_filter_combo.addItem(tr("action_copy"), PlanAction.COPY)
@@ -90,23 +105,23 @@ class PreviewPage(QWidget):
         self.action_filter_combo.addItem(tr("action_conflict"), PlanAction.CONFLICT)
         self.action_filter_combo.addItem(tr("action_skip"), PlanAction.SKIP)
         self.action_filter_combo.currentIndexChanged.connect(self.filter_preview_table)
-        top_ctrl.addWidget(self.action_filter_combo)
+        filters_row.addWidget(self.action_filter_combo)
 
         self.search_type_combo = QComboBox()
+        self.search_type_combo.setMinimumWidth(110)
         self.search_type_combo.addItem("🔍 Всюди", "all")
         self.search_type_combo.addItem("📄 Ім'я файлу", "name")
         self.search_type_combo.addItem("📁 Шлях", "path")
         self.search_type_combo.addItem("🏷️ Розширення", "ext")
         self.search_type_combo.currentIndexChanged.connect(self.filter_preview_table)
-        top_ctrl.addWidget(self.search_type_combo)
+        filters_row.addWidget(self.search_type_combo)
 
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText(tr("search_placeholder"))
         self.search_edit.textChanged.connect(self.filter_preview_table)
-        top_ctrl.addWidget(self.search_edit)
+        filters_row.addWidget(self.search_edit, stretch=1)
 
-        top_ctrl.addStretch()
-        layout.addLayout(top_ctrl)
+        layout.addLayout(filters_row)
 
         # Bulk action row for visible files
         bulk_row = QHBoxLayout()
