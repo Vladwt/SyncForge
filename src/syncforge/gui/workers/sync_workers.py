@@ -104,6 +104,7 @@ class SyncExecutionWorker(QThread):
         self.orchestrator = orchestrator
         self.items = items
         self.is_aborted = False
+        self.orchestrator.reset()
 
     def pause(self):
         """Pauses the underlying orchestrator execution."""
@@ -131,7 +132,8 @@ class SyncExecutionWorker(QThread):
             last_status = ExecutionStatus.SUCCESS
 
             for profile, ops in self.items:
-                if self.is_aborted:
+                if self.is_aborted or getattr(self.orchestrator, "_is_cancelled", False):
+                    last_status = ExecutionStatus.CANCELLED
                     break
 
                 def sub_progress(p: TransferProgress, base=completed_overall, total=total_ops_count):
@@ -162,7 +164,7 @@ class SyncExecutionWorker(QThread):
 
                 completed_overall += len(ops)
 
-            if last_status == ExecutionStatus.CANCELLED:
+            if last_status == ExecutionStatus.CANCELLED or self.is_aborted or getattr(self.orchestrator, "_is_cancelled", False):
                 final_status = ExecutionStatus.CANCELLED
             elif not all_failed and last_status == ExecutionStatus.SUCCESS:
                 final_status = ExecutionStatus.SUCCESS

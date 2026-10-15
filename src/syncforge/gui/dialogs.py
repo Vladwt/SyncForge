@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox, QPushButton, QTableWidget,
     QTableWidgetItem, QHeaderView, QFileDialog, QMessageBox,
-    QGroupBox, QFormLayout
+    QGroupBox, QFormLayout, QScrollArea, QWidget, QFrame, QPlainTextEdit
 )
 from syncforge.core.models import SyncProfile, FolderMapping, SyncMode, DeviceInfo, DeletionPolicy, AnalysisMode
 from syncforge.core.path_validator import PathValidator
@@ -26,12 +26,37 @@ class ProfileEditorDialog(QDialog):
         self.result_profile: Optional[SyncProfile] = None
 
         self.setWindowTitle(tr("profile_editor_title"))
-        self.resize(720, 620)
+        self.setMinimumSize(780, 540)
+
+        # Dynamic height adaptation: ensure it comfortably fits 1080p, 720p or high-DPI displays
+        screen = self.screen() or (parent.screen() if parent else None)
+        if screen:
+            avail_h = screen.availableGeometry().height()
+            target_h = min(740, max(520, int(avail_h * 0.78)))
+            self.resize(860, target_h)
+            self.setMaximumHeight(int(avail_h * 0.94))
+        else:
+            self.resize(860, 680)
+
         self._init_ui()
 
     def _init_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setSpacing(14)
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(16, 16, 16, 16)
+        root_layout.setSpacing(10)
+
+        # Scrollable container for profile settings groups
+        scroll_area = QScrollArea(self)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+
+        scroll_content = QWidget()
+        scroll_content.setStyleSheet("background: transparent;")
+        layout = QVBoxLayout(scroll_content)
+        layout.setContentsMargins(0, 0, 8, 0)
+        layout.setSpacing(12)
 
         # 1. Basic Profile Info Group
         basic_group = QGroupBox(tr("profile_basic_settings"))
@@ -92,7 +117,8 @@ class ProfileEditorDialog(QDialog):
         self.mappings_table.setHorizontalHeaderLabels([tr("source_path"), tr("dest_subpath")])
         self.mappings_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.mappings_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.mappings_table.setMinimumHeight(130)
+        self.mappings_table.setMinimumHeight(100)
+        self.mappings_table.setMaximumHeight(140)
         mappings_layout.addWidget(self.mappings_table)
 
         if self.profile:
@@ -207,8 +233,12 @@ class ProfileEditorDialog(QDialog):
 
         layout.addWidget(io_group)
 
+        scroll_area.setWidget(scroll_content)
+        root_layout.addWidget(scroll_area, 1)
+
         # Dialog Buttons
         btn_box = QHBoxLayout()
+        btn_box.setContentsMargins(0, 4, 0, 0)
         btn_box.addStretch()
         cancel_btn = QPushButton(tr("cancel"))
         cancel_btn.clicked.connect(self.reject)
@@ -217,7 +247,7 @@ class ProfileEditorDialog(QDialog):
         save_btn.clicked.connect(self._validate_and_save)
         btn_box.addWidget(cancel_btn)
         btn_box.addWidget(save_btn)
-        layout.addLayout(btn_box)
+        root_layout.addLayout(btn_box)
 
     def _on_device_changed(self, index: int):
         if self.device_combo.currentData():
@@ -421,3 +451,45 @@ class RuleEditorDialog(QDialog):
             enabled=self.enabled_cb.isChecked()
         )
         self.accept()
+
+
+class ScrollableErrorDialog(QDialog):
+    """Accessible dialog for long error summaries and failed operation lists with scrolling."""
+
+    def __init__(self, parent=None, title: str = "Помилка", summary: str = "", details: str = "", is_warning: bool = False):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumSize(560, 360)
+        self.resize(680, 440)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+
+        if summary:
+            summary_lbl = QLabel(summary)
+            summary_lbl.setWordWrap(True)
+            color_style = "color: #faa61a;" if is_warning else "color: #f2f3f5;"
+            summary_lbl.setStyleSheet(f"font-weight: bold; font-size: 13px; {color_style}")
+            layout.addWidget(summary_lbl)
+
+        self.text_edit = QPlainTextEdit()
+        self.text_edit.setReadOnly(True)
+        self.text_edit.setPlainText(details or summary)
+        self.text_edit.setStyleSheet(
+            "QPlainTextEdit { background-color: #1e1f22; border: 1px solid #2b2d31; border-radius: 4px; padding: 10px; color: #f2f3f5; font-family: 'Consolas', 'Segoe UI', monospace; font-size: 12px; }"
+        )
+        layout.addWidget(self.text_edit, stretch=1)
+
+        btn_box = QHBoxLayout()
+        btn_box.addStretch()
+        ok_btn = QPushButton("Зрозуміло")
+        ok_btn.setProperty("class", "PrimaryBtn")
+        ok_btn.clicked.connect(self.accept)
+        btn_box.addWidget(ok_btn)
+        layout.addLayout(btn_box)
+
+
+def show_scrollable_error(parent, title: str, summary: str, details: str = "", is_warning: bool = False):
+    dlg = ScrollableErrorDialog(parent, title=title, summary=summary, details=details, is_warning=is_warning)
+    return dlg.exec()

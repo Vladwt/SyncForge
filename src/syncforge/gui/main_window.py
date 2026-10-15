@@ -27,7 +27,7 @@ from syncforge.services.file_watcher import DirectoryWatcher
 from syncforge.rules.rule_engine import RuleEngine, Rule, RuleType
 from syncforge.i18n.translations import tr, set_language, format_bytes, CURRENT_LANG
 from syncforge.core.planner import _sort_plan_key
-from syncforge.gui.dialogs import ProfileEditorDialog, RuleEditorDialog
+from syncforge.gui.dialogs import ProfileEditorDialog, RuleEditorDialog, show_scrollable_error
 from syncforge.gui.styles import DARK_STYLESHEET, LIGHT_STYLESHEET, create_app_icon
 from syncforge.gui.workers import PreviewScanWorker, SyncExecutionWorker
 from syncforge.gui.pages import (
@@ -994,8 +994,10 @@ class MainWindow(QMainWindow):
 
     def _start_sync_worker(self, items: List[tuple[SyncProfile, List[PlannedOperation]]], is_all: bool):
         if self.sync_worker and self.sync_worker.isRunning():
-            QMessageBox.warning(self, "Попередження", "Синхронізація вже виконується.")
-            return
+            self.sync_worker.wait(1000)
+            if self.sync_worker.isRunning():
+                QMessageBox.warning(self, "Попередження", "Синхронізація вже виконується або завершує попередню дію.")
+                return
 
         self.preview_page.set_syncing_state(True, is_paused=False)
         self.status_lbl.setText(tr("status_syncing"))
@@ -1081,23 +1083,25 @@ class MainWindow(QMainWindow):
             self.status_lbl.setText(f"Завершено: {len(successful_ops)} успішно, {len(failed_ops)} помилок")
             self.status_lbl.setStyleSheet("color: #faa61a; font-weight: bold; padding: 6px;")
 
-            first_errors = []
-            for op in failed_ops[:10]:
+            error_lines = []
+            for op in failed_ops:
                 err = op.error_message or "Невідома помилка"
-                first_errors.append(f"• {op.rel_path}: {err}")
-            more_text = f"\n... та ще {len(failed_ops) - 10} файлів з помилками" if len(failed_ops) > 10 else ""
-            err_summary = "\n".join(first_errors) + more_text
+                error_lines.append(f"• {op.rel_path}\n  Помилка: {err}")
+            details_text = "\n\n".join(error_lines)
 
-            msg_box = QMessageBox(self)
-            msg_box.setIcon(QMessageBox.Warning if successful_ops else QMessageBox.Critical)
-            msg_box.setWindowTitle("Синхронізацію завершено з окремими помилками")
-            msg_box.setText(
+            summary_text = (
                 f"Синхронізація продовжувалася для всіх доступних файлів!\n\n"
-                f"Успішно скопійовано: {len(successful_ops)}\n"
-                f"Пропущено через помилки (файл зайнятий / пошкоджений): {len(failed_ops)}\n\n"
-                f"Деталі (перші помилки):\n{err_summary}"
+                f"• Успішно скопійовано: {len(successful_ops)}\n"
+                f"• Пропущено через помилки (файл зайнятий / пошкоджений / CHKDSK): {len(failed_ops)}"
             )
-            msg_box.exec()
+
+            show_scrollable_error(
+                self,
+                title="Синхронізацію завершено з окремими помилками",
+                summary=summary_text,
+                details=details_text,
+                is_warning=bool(successful_ops)
+            )
         else:
             self.status_lbl.setText(tr("status_ready"))
             self.status_lbl.setStyleSheet("color: #57f287; font-weight: bold; padding: 6px;")
@@ -1120,4 +1124,4 @@ class MainWindow(QMainWindow):
         if hasattr(self, "progress_bar"):
             self.progress_bar.setValue(0)
             self.progress_bar.setFormat("0%")
-        QMessageBox.critical(self, "Помилка синхронізації", err_msg)
+        show_scrollable_error(self, title="Помилка синхронізації", summary=err_msg, details=err_msg, is_warning=False)

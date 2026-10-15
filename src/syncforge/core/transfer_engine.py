@@ -3,10 +3,12 @@
 import os
 import shutil
 import time
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Callable, List
 import uuid
+import blake3
 import structlog
 from syncforge.core.models import (
     PlannedOperation, PlanAction, ExecutionStatus, ConflictResolution, SyncProfile, SyncMode
@@ -60,8 +62,16 @@ class TransferEngine:
         self._is_paused = False
         self.last_abort_reason: Optional[str] = None
 
+    def reset(self):
+        """Resets cancellation and pause flags for a clean execution."""
+        self._is_cancelled = False
+        self._is_paused = False
+        self.last_abort_reason = None
+        self._consecutive_errors = 0
+
     def cancel(self):
         self._is_cancelled = True
+        self._is_paused = False
 
     def pause(self):
         self._is_paused = True
@@ -89,6 +99,12 @@ class TransferEngine:
             status_text="Starting transfer..."
         )
 
+        if self._is_cancelled:
+            progress.status_text = "Синхронізацію скасовано користувачем."
+            if progress_callback:
+                progress_callback(progress)
+            return ExecutionStatus.CANCELLED
+
         version_mgr = None
         if profile.dest_root and profile.preserve_versions:
             version_mgr = VersionManager(Path(profile.dest_root), profile.version_subfolder)
@@ -107,124 +123,202 @@ class TransferEngine:
         speed_limit_mb = max(0.0, getattr(profile, "io_speed_limit_mb", 0.0))
         speed_limit_bps = speed_limit_mb * 1024 * 1024 if speed_limit_mb > 0 else 0.0
 
-        for op in operations:
-            if self._is_cancelled:
-                progress.status_text = "Синхронізацію скасовано користувачем."
+        # SQLite batching buffers
+        pending_baselines: List[tuple] = []
+        pending_tombstones: List[tuple] = []
+        last_flush_time = time.time()
+
+        def flush_batches(force: bool = False):
+            nonlocal last_flush_time
+            now_f = time.time()
+            if force or len(pending_baselines) >= 50 or (now_f - last_flush_time >= 2.0 and pending_baselines):
+                if self.baseline_repo and pending_baselines:
+                    self.baseline_repo.save_baseline_batch(pending_baselines)
+                    pending_baselines.clear()
+                if self.tombstone_repo and pending_tombstones:
+                    self.tombstone_repo.remove_tombstones_batch(pending_tombstones)
+                    pending_tombstones.clear()
+                last_flush_time = now_f
+
+        def on_chunk_transferred(n_bytes: int):
+            nonlocal bytes_transferred, last_time, last_bytes
+            bytes_transferred += n_bytes
+            progress.transferred_bytes = bytes_transferred
+            now_c = time.time()
+            if now_c - last_time >= 0.25:
+                dt = now_c - last_time
+                progress.current_speed_bps = (bytes_transferred - last_bytes) / dt if dt > 0 else 0.0
+                last_time = now_c
+                last_bytes = bytes_transferred
                 if progress_callback:
                     progress_callback(progress)
-                return ExecutionStatus.CANCELLED
 
-            while self._is_paused:
-                time.sleep(0.2)
+        try:
+            for op in operations:
                 if self._is_cancelled:
-                    return ExecutionStatus.CANCELLED
-
-            progress.current_file = op.rel_path
-            now = time.time()
-            if now - last_time >= 0.5:
-                dt = now - last_time
-                progress.current_speed_bps = (bytes_transferred - last_bytes) / dt if dt > 0 else 0
-                last_time = now
-                last_bytes = bytes_transferred
-
-            if progress_callback:
-                progress_callback(progress)
-
-            # Process operation
-            try:
-                if op.action == PlanAction.SKIP:
-                    op.status = ExecutionStatus.SKIPPED
-
-                elif op.action == PlanAction.PRESERVE:
-                    # User confirmed keeping file on SSD or PC
-                    if not op.source_abs and op.dest_abs:
-                        if self.tombstone_repo:
-                            self.tombstone_repo.record_tombstone(
-                                profile.id, op.mapping_id, op.rel_path, "source", "keep_dest"
-                            )
-                        if self.baseline_repo:
-                            self.baseline_repo.remove_baseline_entry(profile.id, op.mapping_id, op.rel_path)
-                    elif op.source_abs and not op.dest_abs:
-                        if self.tombstone_repo:
-                            self.tombstone_repo.record_tombstone(
-                                profile.id, op.mapping_id, op.rel_path, "dest", "keep_src"
-                            )
-                        if self.baseline_repo:
-                            self.baseline_repo.remove_baseline_entry(profile.id, op.mapping_id, op.rel_path)
-                    op.status = ExecutionStatus.SUCCESS
-
-                elif op.action == PlanAction.RESTORE:
-                    self._execute_restore(profile, op, version_mgr)
-                    bytes_transferred += op.size_bytes
-                    progress.transferred_bytes = bytes_transferred
-
-                elif op.action == PlanAction.ARCHIVE:
-                    self._execute_archive(profile, op)
-
-                elif op.action == PlanAction.DELETE_DEST:
-                    self._execute_delete_dest(profile, op)
-
-                elif op.action == PlanAction.IGNORE:
-                    self._execute_ignore(profile, op)
-
-                elif op.action == PlanAction.ERROR:
-                    op.status = ExecutionStatus.FAILED
-                    errors_count += 1
-
-                elif op.action == PlanAction.CONFLICT:
-                    if op.conflict_resolution is not None:
-                        self._resolve_and_execute_conflict(profile, op, version_mgr)
-                    else:
-                        op.status = ExecutionStatus.CONFLICT
-                        conflicts_count += 1
-
-                elif op.action in (PlanAction.COPY, PlanAction.UPDATE):
-                    self._execute_copy_or_update(
-                        profile, op, version_mgr,
-                        buf_size=buf_size,
-                        yield_delay_s=yield_delay_s,
-                        speed_limit_bps=speed_limit_bps
-                    )
-                    bytes_transferred += op.size_bytes
-                    progress.transferred_bytes = bytes_transferred
-
-            except Exception as e:
-                logger.error("Error executing operation", op=op.rel_path, error=str(e))
-                op.status = ExecutionStatus.FAILED
-                op.error_message = str(e)
-                errors_count += 1
-
-                # Detect genuine hardware / device disconnection:
-                # Check whether the drive root / anchor is actually disconnected from the system.
-                is_device_disconnected = False
-                try:
-                    dst_root_check = Path(op.dest_abs).anchor if op.dest_abs else (profile.dest_root or "")
-                    if dst_root_check and not Path(dst_root_check).exists():
-                        is_device_disconnected = True
-                except Exception:
-                    is_device_disconnected = True
-
-                if is_device_disconnected:
-                    reason_msg = f"Цільовий накопичувач відключено ({e})"
-                    logger.critical("Target drive disconnected! Aborting remaining operations.", error=str(e))
-                    progress.status_text = f"Помилка вводу/виводу: накопичувач відключено ({e})"
-                    self.last_abort_reason = reason_msg
-                    progress.completed_operations += 1
+                    progress.status_text = "Синхронізацію скасовано користувачем."
                     if progress_callback:
                         progress_callback(progress)
-                    return ExecutionStatus.FAILED
+                    return ExecutionStatus.CANCELLED
 
-                # For individual file errors (WinError 433 sector corruption, PermissionError, sharing violations, etc.):
-                # Continue transferring the remaining files so the rest of the batch succeeds!
-                logger.warning("Skipping failed file and continuing sync for remaining files", op=op.rel_path, error=str(e))
+                while self._is_paused:
+                    time.sleep(0.2)
+                    if self._is_cancelled:
+                        return ExecutionStatus.CANCELLED
 
-            # Inter-file yield delay if configured
-            if yield_delay_s > 0:
-                time.sleep(yield_delay_s)
+                progress.current_file = op.rel_path
+                now = time.time()
+                if now - last_time >= 0.5:
+                    dt = now - last_time
+                    progress.current_speed_bps = (bytes_transferred - last_bytes) / dt if dt > 0 else 0.0
+                    last_time = now
+                    last_bytes = bytes_transferred
 
-            progress.completed_operations += 1
-            if progress_callback:
-                progress_callback(progress)
+                if progress_callback:
+                    progress_callback(progress)
+
+                # Process operation
+                try:
+                    if op.action == PlanAction.SKIP:
+                        op.status = ExecutionStatus.SKIPPED
+
+                    elif op.action == PlanAction.PRESERVE:
+                        # User confirmed keeping file on SSD or PC
+                        if not op.source_abs and op.dest_abs:
+                            if self.tombstone_repo:
+                                self.tombstone_repo.record_tombstone(
+                                    profile.id, op.mapping_id, op.rel_path, "source", "keep_dest"
+                                )
+                            if self.baseline_repo:
+                                self.baseline_repo.remove_baseline_entry(profile.id, op.mapping_id, op.rel_path)
+                        elif op.source_abs and not op.dest_abs:
+                            if self.tombstone_repo:
+                                self.tombstone_repo.record_tombstone(
+                                    profile.id, op.mapping_id, op.rel_path, "dest", "keep_src"
+                                )
+                            if self.baseline_repo:
+                                self.baseline_repo.remove_baseline_entry(profile.id, op.mapping_id, op.rel_path)
+                        op.status = ExecutionStatus.SUCCESS
+
+                    elif op.action == PlanAction.RESTORE:
+                        self._execute_restore(
+                            profile, op, version_mgr,
+                            buf_size=buf_size,
+                            yield_delay_s=yield_delay_s,
+                            speed_limit_bps=speed_limit_bps,
+                            on_chunk=on_chunk_transferred,
+                            pending_baselines=pending_baselines,
+                            pending_tombstones=pending_tombstones
+                        )
+                        progress.transferred_bytes = bytes_transferred
+
+                    elif op.action == PlanAction.ARCHIVE:
+                        self._execute_archive(profile, op)
+
+                    elif op.action == PlanAction.DELETE_DEST:
+                        self._execute_delete_dest(profile, op)
+
+                    elif op.action == PlanAction.IGNORE:
+                        self._execute_ignore(profile, op)
+
+                    elif op.action == PlanAction.ERROR:
+                        op.status = ExecutionStatus.FAILED
+                        errors_count += 1
+
+                    elif op.action == PlanAction.CONFLICT:
+                        if op.conflict_resolution is not None:
+                            self._resolve_and_execute_conflict(
+                                profile, op, version_mgr,
+                                buf_size=buf_size,
+                                yield_delay_s=yield_delay_s,
+                                speed_limit_bps=speed_limit_bps,
+                                on_chunk=on_chunk_transferred,
+                                pending_baselines=pending_baselines,
+                                pending_tombstones=pending_tombstones
+                            )
+                        else:
+                            op.status = ExecutionStatus.CONFLICT
+                            conflicts_count += 1
+
+                    elif op.action in (PlanAction.COPY, PlanAction.UPDATE):
+                        self._execute_copy_or_update(
+                            profile, op, version_mgr,
+                            buf_size=buf_size,
+                            yield_delay_s=yield_delay_s,
+                            speed_limit_bps=speed_limit_bps,
+                            on_chunk=on_chunk_transferred,
+                            pending_baselines=pending_baselines,
+                            pending_tombstones=pending_tombstones
+                        )
+                        progress.transferred_bytes = bytes_transferred
+
+                    flush_batches(force=False)
+
+                except InterruptedError as e:
+                    logger.info("Operation interrupted by cancellation", op=op.rel_path)
+                    op.status = ExecutionStatus.CANCELLED
+                    op.error_message = str(e)
+                    progress.status_text = "Синхронізацію скасовано користувачем."
+                    if progress_callback:
+                        progress_callback(progress)
+                    return ExecutionStatus.CANCELLED
+
+                except Exception as e:
+                    if self._is_cancelled:
+                        logger.info("Operation interrupted by cancellation", op=op.rel_path)
+                        op.status = ExecutionStatus.CANCELLED
+                        op.error_message = str(e)
+                        progress.status_text = "Синхронізацію скасовано користувачем."
+                        if progress_callback:
+                            progress_callback(progress)
+                        return ExecutionStatus.CANCELLED
+
+                    logger.error("Error executing operation", op=op.rel_path, error=str(e))
+                    op.status = ExecutionStatus.FAILED
+                    winerror = getattr(e, "winerror", None)
+                    if winerror in (1392, 433, 23):
+                        op.error_message = f"Файл/сектор пошкоджено (потрібен CHKDSK): {e}"
+                    else:
+                        op.error_message = str(e)
+                    errors_count += 1
+
+                    # Detect genuine hardware / device disconnection:
+                    # Check whether the drive root / anchor is physically missing from the OS.
+                    is_device_disconnected = False
+                    try:
+                        dst_root_check = Path(op.dest_abs).anchor if op.dest_abs else (Path(profile.dest_root).anchor if profile.dest_root else "")
+                        src_root_check = Path(op.source_abs).anchor if op.source_abs else ""
+                        if dst_root_check and not Path(dst_root_check).exists():
+                            is_device_disconnected = True
+                        elif src_root_check and not Path(src_root_check).exists():
+                            is_device_disconnected = True
+                    except Exception:
+                        pass
+
+                    if is_device_disconnected:
+                        reason_msg = f"Цільовий накопичувач відключено ({e})"
+                        logger.critical("Target drive disconnected! Aborting remaining operations.", error=str(e))
+                        progress.status_text = f"Помилка вводу/виводу: накопичувач відключено ({e})"
+                        self.last_abort_reason = reason_msg
+                        progress.completed_operations += 1
+                        if progress_callback:
+                            progress_callback(progress)
+                        return ExecutionStatus.FAILED
+
+                    # For individual file errors (WinError 1392 sector corruption, PermissionError, sharing violations, etc.):
+                    # Continue transferring the remaining files so the rest of the batch succeeds!
+                    logger.warning("Skipping failed file and continuing sync for remaining files", op=op.rel_path, error=str(e))
+
+                # Inter-file yield delay if configured
+                if yield_delay_s > 0:
+                    time.sleep(yield_delay_s)
+
+                progress.completed_operations += 1
+                if progress_callback:
+                    progress_callback(progress)
+
+        finally:
+            flush_batches(force=True)
 
         status = ExecutionStatus.SUCCESS if errors_count == 0 and conflicts_count == 0 else ExecutionStatus.FAILED
         return status
@@ -236,7 +330,10 @@ class TransferEngine:
         version_mgr: Optional[VersionManager],
         buf_size: int = COPY_BUFFER_SIZE,
         yield_delay_s: float = 0.0,
-        speed_limit_bps: float = 0.0
+        speed_limit_bps: float = 0.0,
+        on_chunk: Optional[Callable[[int], None]] = None,
+        pending_baselines: Optional[List[tuple]] = None,
+        pending_tombstones: Optional[List[tuple]] = None,
     ):
         if not op.source_abs or not op.dest_abs:
             raise ValueError(f"Missing source or destination path for {op.rel_path}")
@@ -263,7 +360,8 @@ class TransferEngine:
         tmp_dst = dst_path.parent / f"{dst_path.name}.{time.time_ns()}.tmp"
 
         try:
-            # Stream copying with throttling
+            src_hasher = blake3.blake3()
+            # Stream copying with single-pass source BLAKE3 hashing & throttling
             with open(src_path, "rb") as fsrc, open(tmp_dst, "wb") as fdst:
                 chunk_start = time.perf_counter()
                 while True:
@@ -278,7 +376,11 @@ class TransferEngine:
                     chunk = fsrc.read(buf_size)
                     if not chunk:
                         break
+                    src_hasher.update(chunk)
                     fdst.write(chunk)
+
+                    if on_chunk:
+                        on_chunk(len(chunk))
 
                     # Speed limit throttle
                     if speed_limit_bps > 0:
@@ -299,6 +401,8 @@ class TransferEngine:
                 except OSError:
                     pass
 
+            src_hash = src_hasher.hexdigest()
+
             # Preserve metadata (timestamps, attributes)
             try:
                 shutil.copystat(str(src_path), str(tmp_dst))
@@ -313,12 +417,16 @@ class TransferEngine:
 
             # Verify BLAKE3 hashes if enabled
             if profile.verify_hashes:
-                src_hash = compute_blake3_hash(src_path)
-                tmp_hash = compute_blake3_hash(tmp_dst)
+                # Source hash is already computed from the streaming copy loop without double reading!
+                # Destination verification uses profile rate limits and buffer size
+                tmp_hash = compute_blake3_hash(
+                    tmp_dst,
+                    chunk_size=buf_size,
+                    yield_delay_ms=profile.io_yield_delay_ms,
+                    speed_limit_mb=profile.io_speed_limit_mb
+                )
                 if src_hash != tmp_hash:
                     raise IOError(f"BLAKE3 hash mismatch! File corrupted during transfer.")
-            else:
-                src_hash = None
 
             # Safe atomic replacement: archive old version right before replace
             if dst_path.exists() and version_mgr and profile.preserve_versions:
@@ -328,20 +436,46 @@ class TransferEngine:
 
             op.status = ExecutionStatus.SUCCESS
 
-            # Clear persistent tombstone on successful copy/update
-            if self.tombstone_repo:
-                self.tombstone_repo.remove_tombstone(profile.id, op.mapping_id, op.rel_path)
+            # Correct Baseline side assignment:
+            # Check if op.source_abs belongs to mapping.source_root (PC side)
+            mapping = next((m for m in profile.mappings if m.id == op.mapping_id), None)
+            is_source_pc = True
+            if mapping and mapping.source_root and op.source_abs:
+                try:
+                    is_source_pc = Path(op.source_abs).resolve().is_relative_to(Path(mapping.source_root).resolve())
+                except Exception:
+                    is_source_pc = op.source_abs.replace('/', '\\').lower().startswith(
+                        mapping.source_root.replace('/', '\\').lower()
+                    )
 
-            # Update baseline across all modes so deletion tracking works reliably
-            if self.baseline_repo:
-                dst_st = dst_path.stat()
+            dst_st = dst_path.stat()
+            if is_source_pc:
+                pc_stat = src_stat
+                ssd_stat = dst_st
+            else:
+                pc_stat = dst_st
+                ssd_stat = src_stat
+
+            now_dt = datetime.now()
+
+            # Record baseline entries
+            if pending_baselines is not None:
+                pending_baselines.append((
+                    profile.id, op.mapping_id, op.rel_path, "source",
+                    pc_stat.st_size, int(pc_stat.st_mtime_ns), src_hash, now_dt
+                ))
+                pending_baselines.append((
+                    profile.id, op.mapping_id, op.rel_path, "dest",
+                    ssd_stat.st_size, int(ssd_stat.st_mtime_ns), src_hash, now_dt
+                ))
+            elif self.baseline_repo:
                 self.baseline_repo.save_baseline_entry(
                     profile_id=profile.id,
                     mapping_id=op.mapping_id,
                     rel_path=op.rel_path,
                     side="source",
-                    size_bytes=src_stat.st_size,
-                    mtime_ns=int(src_stat.st_mtime_ns),
+                    size_bytes=pc_stat.st_size,
+                    mtime_ns=int(pc_stat.st_mtime_ns),
                     hash_blake3=src_hash
                 )
                 self.baseline_repo.save_baseline_entry(
@@ -349,10 +483,16 @@ class TransferEngine:
                     mapping_id=op.mapping_id,
                     rel_path=op.rel_path,
                     side="dest",
-                    size_bytes=dst_st.st_size,
-                    mtime_ns=int(dst_st.st_mtime_ns),
+                    size_bytes=ssd_stat.st_size,
+                    mtime_ns=int(ssd_stat.st_mtime_ns),
                     hash_blake3=src_hash
                 )
+
+            # Clear persistent tombstone on successful copy/update
+            if pending_tombstones is not None:
+                pending_tombstones.append((profile.id, op.mapping_id, op.rel_path))
+            elif self.tombstone_repo:
+                self.tombstone_repo.remove_tombstone(profile.id, op.mapping_id, op.rel_path)
 
         except Exception as e:
             if tmp_dst.exists():
@@ -363,7 +503,16 @@ class TransferEngine:
             raise e
 
     def _execute_restore(
-        self, profile: SyncProfile, op: PlannedOperation, version_mgr: Optional[VersionManager]
+        self,
+        profile: SyncProfile,
+        op: PlannedOperation,
+        version_mgr: Optional[VersionManager],
+        buf_size: int = COPY_BUFFER_SIZE,
+        yield_delay_s: float = 0.0,
+        speed_limit_bps: float = 0.0,
+        on_chunk: Optional[Callable[[int], None]] = None,
+        pending_baselines: Optional[List[tuple]] = None,
+        pending_tombstones: Optional[List[tuple]] = None,
     ):
         """Restores a file from destination SSD back to PC source."""
         if not op.dest_abs or not Path(op.dest_abs).exists():
@@ -387,8 +536,18 @@ class TransferEngine:
             dest_abs=str(src_path),  # Write to PC
             size_bytes=op.size_bytes
         )
-        self._execute_copy_or_update(profile, restore_op, version_mgr)
-        if self.tombstone_repo:
+        self._execute_copy_or_update(
+            profile, restore_op, version_mgr,
+            buf_size=buf_size,
+            yield_delay_s=yield_delay_s,
+            speed_limit_bps=speed_limit_bps,
+            on_chunk=on_chunk,
+            pending_baselines=pending_baselines,
+            pending_tombstones=pending_tombstones
+        )
+        if pending_tombstones is not None:
+            pending_tombstones.append((profile.id, op.mapping_id, op.rel_path))
+        elif self.tombstone_repo:
             self.tombstone_repo.remove_tombstone(profile.id, op.mapping_id, op.rel_path)
         op.status = ExecutionStatus.SUCCESS
 
@@ -449,7 +608,16 @@ class TransferEngine:
         op.status = ExecutionStatus.SKIPPED
 
     def _resolve_and_execute_conflict(
-        self, profile: SyncProfile, op: PlannedOperation, version_mgr: Optional[VersionManager]
+        self,
+        profile: SyncProfile,
+        op: PlannedOperation,
+        version_mgr: Optional[VersionManager],
+        buf_size: int = COPY_BUFFER_SIZE,
+        yield_delay_s: float = 0.0,
+        speed_limit_bps: float = 0.0,
+        on_chunk: Optional[Callable[[int], None]] = None,
+        pending_baselines: Optional[List[tuple]] = None,
+        pending_tombstones: Optional[List[tuple]] = None,
     ):
         """Executes a conflict resolution decision."""
         if op.conflict_resolution == ConflictResolution.SKIP:
@@ -458,7 +626,15 @@ class TransferEngine:
 
         elif op.conflict_resolution == ConflictResolution.KEEP_SOURCE:
             # Overwrite dest with source
-            self._execute_copy_or_update(profile, op, version_mgr)
+            self._execute_copy_or_update(
+                profile, op, version_mgr,
+                buf_size=buf_size,
+                yield_delay_s=yield_delay_s,
+                speed_limit_bps=speed_limit_bps,
+                on_chunk=on_chunk,
+                pending_baselines=pending_baselines,
+                pending_tombstones=pending_tombstones
+            )
 
         elif op.conflict_resolution == ConflictResolution.KEEP_DEST:
             # Overwrite source with dest: invert source and dest
@@ -472,7 +648,15 @@ class TransferEngine:
                 dest_abs=op.source_abs,
                 size_bytes=op.size_bytes
             )
-            self._execute_copy_or_update(profile, inverted_op, version_mgr)
+            self._execute_copy_or_update(
+                profile, inverted_op, version_mgr,
+                buf_size=buf_size,
+                yield_delay_s=yield_delay_s,
+                speed_limit_bps=speed_limit_bps,
+                on_chunk=on_chunk,
+                pending_baselines=pending_baselines,
+                pending_tombstones=pending_tombstones
+            )
             op.status = ExecutionStatus.SUCCESS
 
         elif op.conflict_resolution == ConflictResolution.KEEP_BOTH:
@@ -493,5 +677,13 @@ class TransferEngine:
                 dest_abs=str(new_dst),
                 size_bytes=op.size_bytes
             )
-            self._execute_copy_or_update(profile, custom_op, version_mgr)
+            self._execute_copy_or_update(
+                profile, custom_op, version_mgr,
+                buf_size=buf_size,
+                yield_delay_s=yield_delay_s,
+                speed_limit_bps=speed_limit_bps,
+                on_chunk=on_chunk,
+                pending_baselines=pending_baselines,
+                pending_tombstones=pending_tombstones
+            )
             op.status = ExecutionStatus.SUCCESS

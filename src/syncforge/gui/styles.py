@@ -80,6 +80,10 @@ QHeaderView::section {
     border: none;
     font-weight: bold;
 }
+QTableCornerButton::section {
+    background-color: #2b2d31;
+    border: none;
+}
 QLineEdit, QComboBox, QSpinBox {
     background-color: #1e1f22;
     border: 1px solid #35373c;
@@ -99,7 +103,8 @@ QComboBox QAbstractItemView {
 QProgressBar {
     background-color: #1e1f22;
     border-radius: 4px;
-    text-align: center;
+    text-align: left;
+    padding-left: 10px;
     color: white;
     height: 18px;
 }
@@ -193,12 +198,28 @@ QHeaderView::section {
     border: none;
     font-weight: bold;
 }
+QTableCornerButton::section {
+    background-color: #e3e5e8;
+    border: none;
+}
 QLineEdit, QComboBox, QSpinBox {
     background-color: #ffffff;
     border: 1px solid #c7ccd1;
     border-radius: 4px;
     padding: 6px;
     color: #2e3338;
+}
+QProgressBar {
+    background-color: #e3e5e8;
+    border-radius: 4px;
+    text-align: left;
+    padding-left: 10px;
+    color: #2e3338;
+    height: 18px;
+}
+QProgressBar::chunk {
+    background-color: #5865f2;
+    border-radius: 4px;
 }
 QFrame.Card {
     background-color: #ffffff;

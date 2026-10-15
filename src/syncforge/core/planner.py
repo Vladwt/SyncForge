@@ -219,9 +219,8 @@ class SyncPlanner:
             # Look up destination file metadata under its actual routed destination path
             dst_meta = dst_files.get(routed_rel) or dst_files.get(rel_path)
 
-            # Detect destination collisions from routing rules (only applies when files exist on source)
-            src_abs = str(src_root / rel_path) if src_meta else None
-            dst_abs = str(dst_root / routed_rel) if dst_meta or src_meta else None
+            src_abs = str(src_root / rel_path)
+            dst_abs = str(dst_root / routed_rel)
 
             if src_meta and routed_rel.lower() in dest_target_map:
                 prev_path = dest_target_map[routed_rel.lower()]

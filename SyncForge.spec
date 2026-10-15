@@ -22,6 +22,7 @@ a = Analysis(
         'syncforge.services.sync_orchestrator',
         'syncforge.rules.rule_engine',
         'syncforge.gui.main_window',
+        'syncforge.gui.dialogs',
         'syncforge.gui.styles',
         'syncforge.gui.workers',
         'syncforge.gui.workers.sync_workers',

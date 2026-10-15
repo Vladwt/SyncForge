@@ -502,6 +502,21 @@ class BaselineRepository:
                 }
             return result
 
+    def save_baseline_batch(self, entries: List[tuple]):
+        """Saves a batch of baseline entries in a single atomic transaction."""
+        if not entries:
+            return
+        with self.db.get_connection() as conn:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO baselines (
+                    profile_id, mapping_id, rel_path, side, size_bytes, mtime_ns, hash_blake3, last_synced_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                entries
+            )
+            conn.commit()
+
     def remove_baseline_entry(self, profile_id: str, mapping_id: str, rel_path: str):
         with self.db.get_connection() as conn:
             conn.execute(
@@ -547,6 +562,17 @@ class TombstoneRepository:
             conn.execute(
                 "DELETE FROM tombstones WHERE profile_id = ? AND mapping_id = ? AND rel_path = ?",
                 (profile_id, mapping_id, rel_path)
+            )
+            conn.commit()
+
+    def remove_tombstones_batch(self, entries: List[tuple]):
+        """Removes a batch of tombstones in a single atomic transaction."""
+        if not entries:
+            return
+        with self.db.get_connection() as conn:
+            conn.executemany(
+                "DELETE FROM tombstones WHERE profile_id = ? AND mapping_id = ? AND rel_path = ?",
+                entries
             )
             conn.commit()
 

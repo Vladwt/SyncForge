@@ -42,9 +42,16 @@ class SyncOrchestrator:
             tombstone_repo=tombstone_repo,
             rule_repo=rule_repo
         )
+        self._is_cancelled = False
+
+    def reset(self):
+        """Resets cancellation and pause state for a clean execution."""
+        self._is_cancelled = False
+        self.engine.reset()
 
     def cancel(self):
         """Cancels active transfer execution."""
+        self._is_cancelled = True
         self.engine.cancel()
 
     def pause(self):
@@ -91,6 +98,10 @@ class SyncOrchestrator:
         started_at = datetime.utcnow()
 
         try:
+            if self._is_cancelled:
+                logger.info("Sync execution cancelled before start", job_id=job_id)
+                return ExecutionStatus.CANCELLED
+
             # SAFETY RE-VERIFICATION immediately before writes
             active_dest_root = self._resolve_and_verify_dest_root(profile)
             profile.dest_root = active_dest_root
